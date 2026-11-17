@@ -214,6 +214,18 @@ function ocrToId(text, barcodeId) {
   }
   return id;
 }
+// printed card fronts number their fields (1 = family name, 2 = given names) or label them LN/FN
+function guessName(text) {
+  const line = (re) => { const m = text.match(re); return m ? m[1].replace(/[^A-Za-z' -]/g, " ").replace(/\s+/g, " ").trim() : ""; };
+  let last = line(/^[ \t]*(?:1|LN|LAST(?: NAME)?)[ \t.:]+([A-Za-z][A-Za-z' -]{1,30})$/im);
+  let given = line(/^[ \t]*(?:2|FN|FIRST(?: NAME)?)[ \t.:]+([A-Za-z][A-Za-z' -]{1,40})$/im);
+  if (!last) { const m = text.match(/^[ \t]*([A-Z][A-Z'-]{1,25}),[ \t]*([A-Z][A-Z' -]{1,40})$/m); if (m) { last = m[1]; given = m[2]; } }
+  if (!last || !given || last.length < 2) return null;
+  const g = given.split(" ");
+  return { last, first: g[0], middle: g.slice(1).join(" ") };
+}
+const looksLikeId = (text) =>
+  (text.match(/DRIVER|LICEN[CS]E|IDENTIFICATION|IDENTITY|\bDOB\b|BIRTH|REAL ?ID|\bDL\b|\bEXP|\bISS|\bSEX\b|\bHGT\b|CLASS/gi) || []).length >= 2;
 // text reads are noisy: only accept one that clearly points at a passenger
 const ocrAcceptable = (res) => res.p && res.n.lastHit && (res.n.firstOk || res.n.firstPrefix || res.dobOk);
 const srcName = (id) => (id.key && id.key.startsWith("mrz:") ? "passport" : id.ocr ? "card text" : id.tokens ? "badge" : "ID");
@@ -326,7 +338,7 @@ function idKey(id) {
   return id.tokens ? "raw:" + id.raw : `${norm(id.last)}|${norm(id.first)}|${fmtDate(id.dob)}`;
 }
 function idLabel(id) {
-  if (id.tokens) return id.raw.length > 40 ? id.raw.slice(0, 40) + "…" : id.raw;
+  if (id.tokens && !id.last) return id.raw.length > 40 ? id.raw.slice(0, 40) + "…" : id.raw;
   return [id.first, id.middle, id.last].filter(Boolean).join(" ");
 }
 let actx = null;
@@ -435,23 +447,53 @@ function handleScan(text, img, fromPhoto) {
 }
 
 // ---------- text reading (passport MRZ, ID fronts, badges) ----------
-let ocrBusy = false, lastOcrAt = 0, ocrQuietUntil = 0;
+let ocrBusy = false, lastOcrAt = 0, ocrQuietUntil = 0, ocrHint = "", lastStranger = "";
 function ocrState(msg) { const e = $("#ocrState"); if (e) { e.textContent = msg; e.hidden = !msg; } }
+// grayscale + contrast stretch: helps with glare, colored card backgrounds and dim light
+function enhance(img) {
+  const d = img.data, n = d.length / 4, hist = new Uint32Array(256), Y = new Uint8Array(n);
+  for (let i = 0; i < n; i++) { const y = (d[i * 4] * 77 + d[i * 4 + 1] * 150 + d[i * 4 + 2] * 29) >> 8; Y[i] = y; hist[y]++; }
+  let lo = 0, hi = 255, acc = 0;
+  while (lo < 255 && (acc += hist[lo]) < n * 0.02) lo++;
+  acc = 0; while (hi > 0 && (acc += hist[hi]) < n * 0.02) hi--;
+  const k = 255 / Math.max(16, hi - lo);
+  for (let i = 0; i < n; i++) { const v = Math.max(0, Math.min(255, (Y[i] - lo) * k)); d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v; }
+  return img;
+}
 async function runOCR(img, barcodeId, fromPhoto) {
   ocrBusy = true; lastOcrAt = Date.now();
-  ocrState("Reading text…");
+  ocrState(ocrHint || "Reading text…");
   try {
-    const text = await ocrImage(img);
+    const text = await ocrImage(enhance(img));
     if (!trip) return false;
     const id = ocrToId(text, barcodeId);
     const res = match(id);
     if (id.key || ocrAcceptable(res)) {
       if (!id.key) id.key = barcodeId ? "raw:" + barcodeId.raw : "ocr:" + res.p.name;
-      ocrQuietUntil = Date.now() + 3000;
+      ocrQuietUntil = Date.now() + 3000; ocrHint = ""; lastStranger = "";
       logScan(res, id);
       return true;
     }
     if (barcodeId) { barcodeId.retried = true; logScan(match(barcodeId), barcodeId); return true; }
+    // not accepted: tell the operator what was seen, and catch IDs of people not on the sheet
+    const letters = (text.match(/[A-Za-z]/g) || []).length;
+    const guess = !id.key && looksLikeId(text) ? guessName(text) : null;
+    if (res.p) ocrHint = `Close to ${res.p.name} — hold steady, closer`;
+    else if (/<<</.test(text)) ocrHint = "Passport code seen — hold steady, no glare";
+    else if (guess && id.dates.length) {
+      const k = norm(guess.last + "|" + guess.first);
+      if (k === lastStranger || fromPhoto) {
+        // same name read twice and nobody on the sheet comes close
+        Object.assign(id, guess, { kind: "ID front (text read)", key: "ocrnm:" + k });
+        ocrQuietUntil = Date.now() + 3000; ocrHint = ""; lastStranger = "";
+        logScan(res, id);
+        return true;
+      }
+      lastStranger = k;
+      ocrHint = `Saw ${guess.first} ${guess.last} — checking…`;
+    } else if (letters < 12) ocrHint = "No text seen — hold card closer, flat, no glare";
+    else ocrHint = "No trip-sheet name read — move closer";
+    if (!fromPhoto) ocrState(ocrHint);
     return false;
   } catch (e) {
     console.warn(e);
@@ -459,12 +501,13 @@ async function runOCR(img, barcodeId, fromPhoto) {
     if (barcodeId) { barcodeId.retried = true; logScan(match(barcodeId), barcodeId); return true; }
     return false;
   } finally {
-    ocrBusy = false; lastOcrAt = Date.now(); ocrState("");
+    ocrBusy = false; lastOcrAt = Date.now();
+    if (!ocrHint || !stream) ocrState("");
   }
 }
 const ocrCanvas = document.createElement("canvas");
 // the part of the video the user actually sees (object-fit: cover), scaled to ≤ maxW wide
-function visibleFrame(v, maxW = 1280) {
+function visibleFrame(v, maxW = 1600) {
   const r = v.getBoundingClientRect(), vw = v.videoWidth, vh = v.videoHeight;
   const s = Math.max(r.width / vw, r.height / vh) || 1;
   const sw = Math.min(vw, r.width / s), sh = Math.min(vh, r.height / s);
@@ -538,7 +581,7 @@ async function startCam() {
 function stopCam() {
   pauseScan();
   if (stream) stream.getTracks().forEach((t) => t.stop());
-  stream = null; $("#cam").hidden = true; $("#scanBtn").textContent = "Start camera";
+  stream = null; ocrHint = ""; ocrState(""); $("#cam").hidden = true; $("#scanBtn").textContent = "Start camera";
 }
 function pauseScan() { scanning = false; clearTimeout(timer); }
 function resumeScan() { if (!stream) return; scanning = true; tick(); }
@@ -576,7 +619,7 @@ async function scanPhoto(file) {
     const img = await fileToImageData(file);
     if (res.length && res[0].text) { lastScanText = ""; await handleScan(res[0].text, img, true); return; }
     if (!(await runOCR(img, null, true)))
-      toast("Couldn't read a trip-sheet name from that photo. Fill the frame with the ID or passport photo page, good light — or check by eye and tap the passenger to board.");
+      toast(`${ocrHint || "Couldn't read a trip-sheet name from that photo"}. Fill the frame with the ID or passport photo page, good light — or check by eye and tap the passenger to board.`);
   } finally { $("#busy").hidden = true; }
 }
 
