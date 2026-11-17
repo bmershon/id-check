@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' blob:; style-src 'unsafe-inline'; img-src data: blob:; media-src blob: mediastream:; worker-src blob:; connect-src data: blob:">
+<title>Door ID Check</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a2129; --tx:#e8edf2; --mut:#8b98a5; --ac:#3d8bfd; --g:#1e9e57; --y:#d9a400; --r:#d93a3a; }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  body { margin:0; font:16px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--tx); padding:env(safe-area-inset-top) 12px 40px; }
+  h1 { font-size:20px; margin:14px 0 4px; }
+  p.mut, small { color:var(--mut); }
+  button, .filebtn { display:inline-block; background:var(--ac); color:#fff; border:0; border-radius:10px; padding:13px 16px; font-size:16px; font-weight:600; margin:4px 4px 4px 0; cursor:pointer; text-align:center; }
+  button.sec, .filebtn.sec { background:#2c3640; }
+  input[type=file] { display:none; }
+  textarea, input[type=search], select { width:100%; background:var(--card); color:var(--tx); border:1px solid #2c3640; border-radius:10px; padding:10px; font-size:16px; }
+  textarea { height:120px; }
+  .card { background:var(--card); border-radius:14px; padding:14px; margin:12px 0; }
+  header { position:sticky; top:0; background:var(--bg); padding:8px 0; z-index:5; }
+  .row { display:flex; align-items:center; gap:8px; }
+  .row .grow { flex:1; min-width:0; }
+  #tripTitle { font-weight:700; font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .count { font-size:28px; font-weight:800; font-variant-numeric:tabular-nums; }
+  .count.done { color:var(--g); }
+  #cam { position:relative; margin:8px 0; }
+  #video { width:100%; border-radius:12px; background:#000; max-height:42vh; object-fit:cover; }
+  #cam .guide { position:absolute; left:6%; right:6%; top:28%; bottom:28%; border:3px solid rgba(255,255,255,.7); border-radius:10px; pointer-events:none; }
+  #cam .hint { position:absolute; bottom:8px; left:0; right:0; text-align:center; font-size:13px; color:#fff; text-shadow:0 1px 3px #000; }
+  #camErr { color:var(--y); }
+  ul#list { list-style:none; padding:0; margin:8px 0; }
+  #list li { display:grid; grid-template-columns:1fr auto; grid-template-areas:"nm st" "meta st"; background:var(--card); border-radius:10px; padding:10px 12px; margin:6px 0; border-left:5px solid #2c3640; cursor:pointer; }
+  #list li.boarded { border-left-color:var(--g); opacity:.6; }
+  #list li.flagged { border-left-color:var(--r); }
+  #list .nm { grid-area:nm; } #list .meta { grid-area:meta; color:var(--mut); font-size:14px; }
+  #list .st { grid-area:st; font-size:24px; font-weight:800; align-self:center; color:var(--g); }
+  #list li.flagged .st { color:var(--r); }
+  .tag { background:#2c3640; color:var(--mut); font-size:11px; padding:1px 6px; border-radius:6px; vertical-align:middle; }
+  .result { position:fixed; left:8px; right:8px; bottom:8px; max-height:80vh; overflow:auto; border-radius:16px; padding:16px; z-index:20; box-shadow:0 10px 40px rgba(0,0,0,.6); }
+  .result.green { background:#0f3d24; border:3px solid var(--g); }
+  .result.yellow { background:#3d3305; border:3px solid var(--y); }
+  .result.red { background:#4a1414; border:3px solid var(--r); }
+  .result.manual { background:var(--card); border:3px solid var(--ac); }
+  .result .big { font-size:30px; font-weight:900; letter-spacing:.5px; }
+  .result .who { font-size:20px; font-weight:700; margin:6px 0; }
+  .result ul { padding-left:18px; margin:8px 0; } .result li.w { color:#ffd166; font-weight:700; }
+  .result pre { white-space:pre-wrap; word-break:break-all; font-size:12px; background:#0008; padding:8px; border-radius:8px; }
+  #busy { position:fixed; inset:0; background:#000a; display:flex; align-items:center; justify-content:center; font-size:20px; z-index:30; }
+  #pending { font-size:14px; color:var(--mut); }
+  #toast { position:fixed; left:12px; right:12px; top:12px; background:#2c3640; padding:12px; border-radius:10px; z-index:40; font-weight:600; }
+  .chips { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin:6px 0; }
+  .chip { text-decoration:none; color:var(--tx); background:var(--card); border-radius:10px; padding:6px 4px; text-align:center; font-size:12px; border-top:4px solid; }
+  .chip b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
+  .chip.g { border-color:var(--g); } .chip.n { border-color:#6b7785; } .chip.y { border-color:var(--y); } .chip.r { border-color:var(--r); }
+  .sec h2 { font-size:15px; margin:14px 0 4px; text-transform:uppercase; letter-spacing:.5px; }
+  .sec.r h2 { color:#ff6b6b; } .sec.y h2 { color:#ffd166; } .sec.n h2 { color:var(--mut); } .sec.g h2 { color:#4ade80; }
+  ul.lst { list-style:none; padding:0; margin:0; }
+  .lst li { display:grid; grid-template-columns:1fr auto; grid-template-areas:"nm st" "meta st"; background:var(--card); border-radius:10px; padding:10px 12px; margin:6px 0; border-left:6px solid #2c3640; cursor:pointer; }
+  .lst li.green { border-left-color:var(--g); } .lst li.green .st { color:var(--g); }
+  .lst li.yellow { border-left-color:var(--y); background:#2e2a12; } .lst li.yellow .st { color:var(--y); }
+  .lst li.red { border-left-color:var(--r); background:#3a1717; } .lst li.red .st { color:var(--r); }
+  .lst li.flagged { border-left-color:var(--r); }
+  .lst .nm { grid-area:nm; } .lst .meta { grid-area:meta; color:var(--mut); font-size:13px; }
+  .lst .st { grid-area:st; font-size:26px; font-weight:800; align-self:center; padding-left:8px; }
+  .flash { position:fixed; left:50%; transform:translateX(-50%); top:12px; width:min(560px,94vw); padding:14px; border-radius:12px; font-size:20px; font-weight:800; text-align:center; z-index:35; box-shadow:0 6px 24px #000a; }
+  .flash.green { background:var(--g); } .flash.yellow { background:var(--y); color:#111; } .flash.red { background:var(--r); }
+  @media (min-width:900px) and (orientation:landscape) {
+    #trip { display:grid; grid-template-columns:minmax(380px,42%) 1fr; gap:16px; align-items:start; }
+    #trip header { position:sticky; top:0; }
+    #video { max-height:55vh; }
+    .cols { grid-column:2; grid-row:1 / span 3; }
+  }
+  .priv { font-size:12px; color:var(--mut); margin-top:20px; }
+</style>
+</head>
+<body>
+<section id="load">
+  <h1>Door ID Check</h1>
+  <p class="mut">Load the JetInsight crew itinerary, then scan each passenger's ID barcode.</p>
+  <div class="card">
+    <label class="filebtn">Open itinerary PDF<input id="pdf" type="file" accept="application/pdf"></label>
+  </div>
+  <div class="card">
+    <small>Or paste the passenger list (lines like <i>Jane Doe (Female - 3/7/81)</i>):</small>
+    <textarea id="paste" placeholder="Jane Doe (Female - 3/7/81)"></textarea>
+    <button id="pasteGo" class="sec">Use pasted list</button>
+  </div>
+</section>
+
+<section id="trip" hidden>
+  <header>
+    <div class="row">
+      <div class="grow"><div id="tripTitle"></div><small>boarded / expected</small></div>
+      <div id="count" class="count"></div>
+    </div>
+    <select id="leg" hidden></select>
+    <div class="row">
+      <button id="scanBtn" class="grow">Start camera</button>
+      <label class="filebtn sec">Take photo of barcode<input id="photo" type="file" accept="image/*" capture="environment"></label>
+    </div>
+    <select id="camSel" hidden></select>
+    <div id="camErr" hidden></div>
+    <div id="cam" hidden>
+      <video id="video" playsinline muted></video>
+      <div class="guide"></div>
+      <div class="hint">Barcode on back of license, or badge barcode — fill the box</div>
+      <button id="torch" class="sec" hidden style="position:absolute;top:6px;right:6px;padding:8px 10px">Light</button>
+    </div>
+    <div class="chips">
+      <a href="#sBoard" class="chip g"><b id="cBoard">0</b>Boarded</a>
+      <a href="#sNotHere" class="chip n"><b id="cNotHere">0</b>Not here</a>
+      <a href="#sMism" class="chip y"><b id="cMism">0</b>Mismatch</a>
+      <a href="#sNotOn" class="chip r"><b id="cNotOn">0</b>Not on sheet</a>
+    </div>
+    <input id="search" type="search" placeholder="Search name…">
+  </header>
+  <div id="flash" class="flash" hidden></div>
+  <div class="cols">
+    <section id="sNotOn" class="sec r" hidden><h2>Not on trip sheet</h2><ul id="lNotOn" class="lst"></ul></section>
+    <section id="sMism" class="sec y" hidden><h2>Mismatch — check by eye</h2><ul id="lMism" class="lst"></ul></section>
+    <section id="sNotHere" class="sec n" hidden><h2>Not here yet</h2><ul id="lNotHere" class="lst"></ul></section>
+    <section id="sBoard" class="sec g" hidden><h2>Boarded</h2><ul id="lBoard" class="lst"></ul></section>
+  </div>
+  <button id="close" class="sec">Close trip &amp; erase data</button>
+  <p class="priv">Everything stays on this phone, in memory only. Nothing is saved or sent anywhere; closing the trip or the page erases it. Scanning does not replace comparing the ID photo to the person.</p>
+</section>
+
+<div id="result" class="result" hidden></div>
+<div id="toast" hidden></div>
+<div id="busy" hidden>Working…</div>
+<canvas id="grab" hidden></canvas>
+<!--APP-->
+</body>
+</html>

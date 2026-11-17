@@ -1,0 +1,16 @@
+{
+  "name": "id-check",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "mkdir -p build && base64 -i node_modules/zxing-wasm/dist/reader/zxing_reader.wasm | tr -d \"\\n\" > build/zxing_reader.wasm.b64 && node build.mjs"
+  },
+  "dependencies": {
+    "zxing-wasm": "^3.1.7",
+    "pdfjs-dist": "^4.10.38"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
