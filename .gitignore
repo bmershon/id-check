@@ -3,3 +3,6 @@ build/
 .DS_Store
 *.pdf
 Push to GitHub.command
+
+# local-only test/training data (real IDs, trip sheets) — never commit
+training-data/
