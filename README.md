@@ -1,5 +1,7 @@
 # Door ID Check
 
+## ▶ Open the app: **[bmershon.github.io/id-check](https://bmershon.github.io/id-check/)**
+
 Single-page web app for checking passenger IDs at the airstair against a JetInsight crew itinerary.
 
 - Load the itinerary PDF, paste the passenger list, or photograph the printed trip sheet. Photos and scanned PDFs (no text layer) are read on-device with OCR; the passenger lines land in the paste box to proof-read before use.
