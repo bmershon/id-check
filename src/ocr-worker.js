@@ -3,6 +3,7 @@
 import { createOCREngine, supportsFastBuild } from "tesseract-wasm";
 
 let engine = null;
+const ALL_CHARS = Array.from({ length: 95 }, (_, i) => String.fromCharCode(32 + i)).join("");
 self.onmessage = async (e) => {
   const { id, type } = e.data;
   try {
@@ -12,6 +13,8 @@ self.onmessage = async (e) => {
       engine.loadModel(e.data.model);
       self.postMessage({ id, ok: true });
     } else if (type === "ocr") {
+      // an empty whitelist blocks everything in this build, so "no restriction" = all printable ASCII
+      engine.setVariable("tessedit_char_whitelist", e.data.whitelist || ALL_CHARS);
       engine.loadImage(e.data.image);
       const text = engine.getText();
       engine.clearImage();

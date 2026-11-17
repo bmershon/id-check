@@ -77,9 +77,10 @@
 <body>
 <section id="load">
   <h1>Door ID Check</h1>
-  <p class="mut">Load the JetInsight crew itinerary, then scan each passenger's ID, passport or badge.</p>
+  <p class="mut">Load the JetInsight crew itinerary, then scan each passenger's license / REAL ID barcode or passport.</p>
   <div class="card">
     <label class="filebtn">Open itinerary PDF<input id="pdf" type="file" accept="application/pdf"></label>
+    <label class="filebtn sec">Photo of printed trip sheet<input id="sheetPhoto" type="file" accept="image/*" multiple></label>
   </div>
   <div class="card">
     <small>Or paste the passenger list (lines like <i>Jane Doe (Female - 3/7/81)</i>):</small>
@@ -104,7 +105,7 @@
     <div id="cam" hidden>
       <video id="video" playsinline muted></video>
       <div class="guide"></div>
-      <div class="hint">License back barcode, ID front, passport photo page or badge — fill the frame</div>
+      <div class="hint">Barcode on back of license / REAL ID, or passport photo page (the &lt;&lt;&lt; lines) — fill the frame</div>
       <div id="ocrState" hidden style="position:absolute;top:8px;left:8px;background:#000a;color:#fff;font-size:13px;padding:4px 8px;border-radius:8px"></div>
       <button id="torch" class="sec" hidden style="position:absolute;top:6px;right:6px;padding:8px 10px">Light</button>
     </div>

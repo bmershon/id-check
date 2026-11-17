@@ -1,6 +1,6 @@
-// Text reading for documents without a usable barcode:
+// On-device text reading (Tesseract):
 //  - passports / passport cards: the machine-readable zone (MRZ), validated by check digits
-//  - driver license / REAL ID fronts, employee badges: printed name, dates, sex
+//  - trip sheets: photos or scanned PDFs without a text layer
 import WORKER_SRC from "../build/ocr-worker.js.txt";
 import WASM_B64 from "../build/tesseract-core.wasm.b64";
 import MODEL_B64 from "../build/eng.traineddata.b64";
@@ -36,10 +36,11 @@ export function initOCR() {
   ready.catch(() => {});
   return ready;
 }
-export async function ocrImage(img) {
+export const MRZ_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<";
+export async function ocrImage(img, { whitelist = "" } = {}) {
   await initOCR();
   const data = new Uint8ClampedArray(img.data); // copy so the caller's buffer stays usable
-  return call({ type: "ocr", image: { width: img.width, height: img.height, data } }, [data.buffer]);
+  return call({ type: "ocr", whitelist, image: { width: img.width, height: img.height, data } }, [data.buffer]);
 }
 
 // ---------- MRZ (passport TD3 2x44, passport card / ID card TD1 3x30) ----------
@@ -55,12 +56,12 @@ function mrzLines(text) {
     .toUpperCase()
     .split(/\n+/)
     .map((l) => l.replace(/«/g, "<<").replace(/[‹(\[{]/g, "<").replace(/\s+/g, "").replace(/[^A-Z0-9<]/g, ""))
-    .filter((l) => l.length >= 26 && (l.match(/</g) || []).length >= 2);
+    .filter((l) => l.length >= 20);
 }
+// "ERIKSSON<<ANNA<MARIA<<<<<" — filler '<' is often read as C or K, so trim long tails of them
+const trimFill = (s) => letters(s).replace(/[<CK]{3,}$/, "").replace(/<+$/, "");
 function mrzName(s) {
-  // "ERIKSSON<<ANNA<MARIA<<<<<" — filler '<' is sometimes read as K, so trim long K/< tails
-  s = letters(s).replace(/[<K]{3,}$/, "").replace(/<+$/, "");
-  const [last, rest = ""] = s.split(/<<+/);
+  const [last, rest = ""] = trimFill(s).split(/<<+/);
   const given = rest.split("<").filter(Boolean);
   return { last: last.replace(/</g, " ").trim(), first: given[0] || "", middle: given.slice(1).join(" ") };
 }
@@ -69,42 +70,61 @@ const mrzDate = (s, future) => {
   return { y: future ? 2000 + y : y > cur ? 1900 + y : 2000 + y, m: +s.slice(2, 4), d: +s.slice(4, 6) };
 };
 const mrzSex = (c) => (c === "M" ? "M" : c === "F" ? "F" : "X");
-function result(kind, doc, dobS, sexC, expS, name, country, raw) {
+function result(kind, doc, dobS, sexC, expS, nameField, nameMax, country, raw) {
   const exp = mrzDate(expS, true);
   const dob = mrzDate(dobS, false);
-  if (dob.m < 1 || dob.m > 12 || dob.d < 1 || dob.d > 31) return null;
+  if (dob.m < 1 || dob.m > 12 || dob.d < 1 || dob.d > 31 || exp.m < 1 || exp.m > 12) return null;
   return {
-    kind, ...name, dob, gender: mrzSex(sexC), exp,
+    kind, ...mrzName(nameField), dob, gender: mrzSex(sexC), exp,
     expired: new Date(exp.y, exp.m - 1, exp.d, 23, 59) < new Date(),
     state: country, idLast4: doc.replace(/</g, "").slice(-4),
-    key: `mrz:${doc}|${dobS}`, raw,
+    mrzName: trimFill(nameField), mrzNameMax: nameMax,
+    key: `mrz:${dobS}|${expS}`, raw,
   };
 }
+// The birth and expiry dates each carry a check digit; both must pass. The document number's
+// check digit is not required (one misread letter there shouldn't block a good read).
 export function parseMRZ(text) {
   const L = mrzLines(text);
-  for (let i = 0; i + 1 < L.length; i++) {
-    // TD3: passport book data page
-    if (L[i][0] === "P" && L[i].length >= 38 && L[i + 1].length >= 38) {
-      const a = fit(L[i], 44), b = fit(L[i + 1], 44);
-      const doc = b.slice(0, 9), dob = digits(b.slice(13, 19)), exp = digits(b.slice(21, 27));
-      if (ok(dob, digits(b[19])) && ok(exp, digits(b[27])) && ok(doc, digits(b[9])))
-        return result("Passport (MRZ)", doc, dob, b[20], exp, mrzName(a.slice(5)), letters(a.slice(2, 5)).replace(/</g, ""), `${a}\n${b}`);
+  const hasFill = (...ls) => ls.some((l) => l && /<</.test(l));
+  for (let j = 0; j < L.length; j++) {
+    const b = L[j];
+    // TD3 (passport book), line 2: doc(9) cd nat(3) dob(6) cd sex exp(6) cd …
+    if (b.length >= 28) {
+      const dob = digits(b.slice(13, 19)), exp = digits(b.slice(21, 27));
+      if (ok(dob, digits(b[19])) && ok(exp, digits(b[27])) && hasFill(b, L[j - 1])) {
+        const a = L[j - 1] || "";
+        const r = result("Passport (MRZ)", b.slice(0, 9), dob, b[20], exp, a.length > 5 ? a.slice(5) : "", 39, letters(a.slice(2, 5)).replace(/</g, ""), `${a}
+${b}`);
+        if (r) return r;
+      }
     }
-    // TD1: US passport card, many ID cards (3 lines of 30)
-    if (i + 2 < L.length && /^[ACI]/.test(L[i]) && L[i].length >= 26 && L[i + 1].length >= 26) {
-      const a = fit(L[i], 30), b = fit(L[i + 1], 30), c = fit(L[i + 2], 30);
-      const doc = a.slice(5, 14), dob = digits(b.slice(0, 6)), exp = digits(b.slice(8, 14));
-      if (ok(dob, digits(b[6])) && ok(exp, digits(b[14])) && ok(doc, digits(a[14])))
-        return result(a[1] === "P" ? "Passport card (MRZ)" : "ID card (MRZ)", doc, dob, b[7], exp, mrzName(c), letters(a.slice(2, 5)).replace(/</g, ""), `${a}\n${b}\n${c}`);
+    // TD1 (US passport card, ID cards), line 2: dob(6) cd sex exp(6) cd nat(3) …; names on line 3
+    if (b.length >= 15) {
+      const dob = digits(b.slice(0, 6)), exp = digits(b.slice(8, 14));
+      if (ok(dob, digits(b[6])) && ok(exp, digits(b[14])) && hasFill(b, L[j - 1], L[j + 1])) {
+        const a = L[j - 1] || "", c = L[j + 1] || "";
+        const r = result(a[1] === "P" ? "Passport card (MRZ)" : "ID card (MRZ)", a.slice(5, 14), dob, b[7], exp, c, 30, letters(a.slice(2, 5)).replace(/</g, ""), `${a}\n${b}\n${c}`);
+        if (r) return r;
+      }
     }
   }
   return null;
 }
-
-// ---------- printed card front (license / REAL ID / badge) ----------
-export function ocrFields(text) {
-  // OCR often reads 0 as O inside numbers: "O3/07/1981"
-  const fixed = text.replace(/(\d)[Oo]/g, "$10").replace(/[Oo](\d)/g, "0$1");
-  const sex = fixed.match(/\bSEX\s*[:.]?\s*([MFX])\b/i);
-  return { fixed, gender: sex ? sex[1].toUpperCase() : "" };
+// How closely an OCR'd MRZ name field matches a passenger, 0..1 (tolerates '<' read as C/K, dropped fillers)
+export function mrzNameSimilarity(field, last, given, max) {
+  const z = (s) => (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().replace(/[^A-Z]+/g, "<").replace(/^<|<$/g, "");
+  const want = (z(last) + "<<" + z(given)).slice(0, max);
+  const got = field.replace(/<+$/, "");
+  if (!got || !want) return 0;
+  const d = Array.from({ length: got.length + 1 }, (_, i) => i);
+  for (let j = 1; j <= want.length; j++) {
+    let prev = d[0]; d[0] = j;
+    for (let i = 1; i <= got.length; i++) {
+      const t = d[i];
+      d[i] = Math.min(d[i] + 1, d[i - 1] + 1, prev + (got[i - 1] === want[j - 1] || (got[i - 1] === "<" && "CK".includes(want[j - 1])) || (want[j - 1] === "<" && "CK".includes(got[i - 1])) ? 0 : 1));
+      prev = t;
+    }
+  }
+  return 1 - d[got.length] / Math.max(got.length, want.length);
 }

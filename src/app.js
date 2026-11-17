@@ -2,7 +2,7 @@ import { prepareZXingModule, readBarcodes } from "zxing-wasm/reader";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import * as pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.mjs";
 import WASM_B64 from "../build/zxing_reader.wasm.b64";
-import { initOCR, ocrImage, parseMRZ, ocrFields } from "./ocr.js";
+import { initOCR, ocrImage, parseMRZ, mrzNameSimilarity, MRZ_CHARS } from "./ocr.js";
 
 // ---------- setup ----------
 globalThis.pdfjsWorker = pdfWorker; // run pdf.js in main thread (no worker file needed)
@@ -201,34 +201,7 @@ function parseGeneric(raw) {
   };
 }
 
-function ocrToId(text, barcodeId) {
-  const mrz = parseMRZ(text);
-  if (mrz) return { ...mrz, ocr: true };
-  const { fixed, gender } = ocrFields(text);
-  const id = { kind: "ID front / badge (text read)", first: "", middle: "", last: "", tokens: toks(fixed), dates: findDates(fixed), gender, raw: text, ocr: true };
-  if (barcodeId) {
-    id.kind = "Badge (barcode + printed name)";
-    id.tokens = [...barcodeId.tokens, ...id.tokens];
-    id.dates = [...barcodeId.dates, ...id.dates];
-    id.raw = barcodeId.raw + "\n---\n" + text;
-  }
-  return id;
-}
-// printed card fronts number their fields (1 = family name, 2 = given names) or label them LN/FN
-function guessName(text) {
-  const line = (re) => { const m = text.match(re); return m ? m[1].replace(/[^A-Za-z' -]/g, " ").replace(/\s+/g, " ").trim() : ""; };
-  let last = line(/^[ \t]*(?:1|LN|LAST(?: NAME)?)[ \t.:]+([A-Za-z][A-Za-z' -]{1,30})$/im);
-  let given = line(/^[ \t]*(?:2|FN|FIRST(?: NAME)?)[ \t.:]+([A-Za-z][A-Za-z' -]{1,40})$/im);
-  if (!last) { const m = text.match(/^[ \t]*([A-Z][A-Z'-]{1,25}),[ \t]*([A-Z][A-Z' -]{1,40})$/m); if (m) { last = m[1]; given = m[2]; } }
-  if (!last || !given || last.length < 2) return null;
-  const g = given.split(" ");
-  return { last, first: g[0], middle: g.slice(1).join(" ") };
-}
-const looksLikeId = (text) =>
-  (text.match(/DRIVER|LICEN[CS]E|IDENTIFICATION|IDENTITY|\bDOB\b|BIRTH|REAL ?ID|\bDL\b|\bEXP|\bISS|\bSEX\b|\bHGT\b|CLASS/gi) || []).length >= 2;
-// text reads are noisy: only accept one that clearly points at a passenger
-const ocrAcceptable = (res) => res.p && res.n.lastHit && (res.n.firstOk || res.n.firstPrefix || res.dobOk);
-const srcName = (id) => (id.key && id.key.startsWith("mrz:") ? "passport" : id.ocr ? "card text" : id.tokens ? "badge" : "ID");
+const srcName = (id) => (id.mrz ? "passport" : id.tokens ? "badge" : "ID");
 
 // ---------- matching ----------
 function nameScore(p, id) {
@@ -257,7 +230,13 @@ function match(id) {
   const leg = trip.legs[legIdx];
   let best = null;
   for (const p of leg.pax) {
-    const n = nameScore(p, id);
+    let n = nameScore(p, id);
+    if (id.mrzName != null) {
+      // passport names come from OCR: compare the whole MRZ name field, tolerating misread fillers
+      const sim = mrzNameSimilarity(id.mrzName, p.last, [p.first, p.middle].filter(Boolean).join(" "), id.mrzNameMax);
+      if (sim >= 0.75) n = { ...n, s: Math.max(n.s, 90), lastHit: true, firstOk: true };
+      else if (sim >= 0.5 && !n.lastHit) n = { ...n, s: Math.max(n.s, 20), lastPartial: true };
+    }
     const dobs = id.dob ? [id.dob] : id.dates || [];
     const dobOk = dobs.some((d) => sameDate(d, p.dob));
     const gOk = !id.gender || !p.gender || id.gender === p.gender;
@@ -270,7 +249,7 @@ function match(id) {
   r.push(n.lastHit ? "✓ Last name" : n.lastPartial ? "~ Last name partial" : "✗ Last name");
   r.push(n.firstOk ? "✓ First name" : n.firstPrefix ? "~ First name similar (nickname/short?)" : "✗ First name");
   const hasDob = !!(id.dob || (id.dates && id.dates.length));
-  r.push(dobOk ? "✓ DOB" : hasDob ? `✗ DOB (ID ${fmtDate(id.dob || id.dates[0])} vs manifest ${fmtDate(p.dob)})` : id.ocr ? "— DOB not read from card" : "— DOB not in barcode");
+  r.push(dobOk ? "✓ DOB" : hasDob ? `✗ DOB (ID ${fmtDate(id.dob || id.dates[0])} vs manifest ${fmtDate(p.dob)})` : "— DOB not in barcode");
   if (id.gender) r.push(gOk ? "✓ Gender" : `✗ Gender (ID ${id.gender} vs manifest ${p.gender})`);
   if (id.expired) warn.push(`ID EXPIRED ${fmtDate(id.exp)}`);
   if (id.realId === "No") warn.push("Not REAL ID compliant");
@@ -338,7 +317,7 @@ function idKey(id) {
   return id.tokens ? "raw:" + id.raw : `${norm(id.last)}|${norm(id.first)}|${fmtDate(id.dob)}`;
 }
 function idLabel(id) {
-  if (id.tokens && !id.last) return id.raw.length > 40 ? id.raw.slice(0, 40) + "…" : id.raw;
+  if (id.tokens) return id.raw.length > 40 ? id.raw.slice(0, 40) + "…" : id.raw;
   return [id.first, id.middle, id.last].filter(Boolean).join(" ");
 }
 let actx = null;
@@ -367,7 +346,7 @@ function logScan(res, id) {
   leg.scans = leg.scans || [];
   const key = idKey(id);
   const prev = leg.scans.find((x) => x.key === key);
-  if (id.ocr && (prev || (res.p && res.p.status === "boarded"))) return; // same card still in view
+  if (id.mrz && (prev || (res.p && res.p.status === "boarded"))) return; // same passport still in view
   if (prev) { flash(prev.res.level, `Already scanned: ${prev.res.p ? prev.res.p.name : idLabel(id)}`); return; }
   // a second ID for someone already boarded (e.g. badge after license) — note it, don't double-count
   if (res.p && res.p.status === "boarded" && res.level === "green") {
@@ -415,7 +394,7 @@ function detailSheet(sc) {
       ${res.p && res.p.status === "boarded" && res.level !== "green" && !sc.resolved ? `<div class="w">⚠ ${esc(res.p.name)} is already boarded — this may be a different person or a duplicate.</div><button id="rOk" class="sec">Dismiss (resolved)</button>` : ""}
       ${res.p && res.p.status !== "boarded" ? `<button id="rBoard">Verified by eye — board</button>` : ""}
       ${res.p && res.p.status === "boarded" ? `<button id="rUndo" class="sec">Un-board</button>` : ""}
-      ${id.raw ? `<button id="rRaw" class="sec">${id.ocr ? "Show text read" : "Show barcode text"}</button>` : ""}
+      ${id.raw ? `<button id="rRaw" class="sec">${id.mrz ? "Show passport code" : "Show barcode text"}</button>` : ""}
       <button id="rDel" class="sec">Remove scan</button>
       <button id="rNext">Close</button>
     </div>
@@ -430,79 +409,52 @@ function detailSheet(sc) {
   $("#rNext").onclick = () => { box.hidden = true; };
 }
 
-function handleScan(text, img, fromPhoto) {
+function handleScan(text) {
   if (!trip) return;
   const now = Date.now();
   if (text === lastScanText && now - lastScanAt < 3000) return;
-  const id = parseAAMVA(text) || parseGeneric(text);
-  const res = match(id);
-  if (id.tokens && !res.p && img && !id.retried) {
-    // e.g. employee badge whose barcode is just a number: read the printed name too
-    if (ocrBusy && !fromPhoto) return; // try again on the next frame
-    lastScanText = text; lastScanAt = now;
-    return runOCR(img, id, fromPhoto);
-  }
   lastScanText = text; lastScanAt = now;
-  logScan(res, id);
+  const id = parseAAMVA(text) || parseGeneric(text);
+  logScan(match(id), id);
 }
 
-// ---------- text reading (passport MRZ, ID fronts, badges) ----------
-let ocrBusy = false, lastOcrAt = 0, ocrQuietUntil = 0, ocrHint = "", lastStranger = "";
+// ---------- text reading ----------
+// Camera: only the passport / passport-card machine-readable zone (the <<< lines), which is
+// validated by check digits. Trip sheets: photos and scanned PDFs (see readTripSheetImages).
+let ocrBusy = false, lastOcrAt = 0, ocrQuietUntil = 0;
 function ocrState(msg) { const e = $("#ocrState"); if (e) { e.textContent = msg; e.hidden = !msg; } }
-// grayscale + contrast stretch: helps with glare, colored card backgrounds and dim light
-function enhance(img) {
+// grayscale + contrast stretch: helps with glare, tinted security backgrounds and dim light
+// clip = share of darkest/lightest pixels to saturate; keep it tiny for sparse text on white paper
+function enhance(img, clip = 0.02) {
   const d = img.data, n = d.length / 4, hist = new Uint32Array(256), Y = new Uint8Array(n);
   for (let i = 0; i < n; i++) { const y = (d[i * 4] * 77 + d[i * 4 + 1] * 150 + d[i * 4 + 2] * 29) >> 8; Y[i] = y; hist[y]++; }
   let lo = 0, hi = 255, acc = 0;
-  while (lo < 255 && (acc += hist[lo]) < n * 0.02) lo++;
-  acc = 0; while (hi > 0 && (acc += hist[hi]) < n * 0.02) hi--;
+  while (lo < 255 && (acc += hist[lo]) < n * clip) lo++;
+  acc = 0; while (hi > 0 && (acc += hist[hi]) < n * clip) hi--;
   const k = 255 / Math.max(16, hi - lo);
   for (let i = 0; i < n; i++) { const v = Math.max(0, Math.min(255, (Y[i] - lo) * k)); d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v; }
   return img;
 }
-async function runOCR(img, barcodeId, fromPhoto) {
+async function readPassport(img, fromPhoto) {
   ocrBusy = true; lastOcrAt = Date.now();
-  ocrState(ocrHint || "Reading text…");
   try {
-    const text = await ocrImage(enhance(img));
+    const text = await ocrImage(enhance(img), { whitelist: MRZ_CHARS });
     if (!trip) return false;
-    const id = ocrToId(text, barcodeId);
-    const res = match(id);
-    if (id.key || ocrAcceptable(res)) {
-      if (!id.key) id.key = barcodeId ? "raw:" + barcodeId.raw : "ocr:" + res.p.name;
-      ocrQuietUntil = Date.now() + 3000; ocrHint = ""; lastStranger = "";
-      logScan(res, id);
+    const mrz = parseMRZ(text);
+    if (mrz) {
+      const id = { ...mrz, mrz: true };
+      ocrQuietUntil = Date.now() + 3000; ocrState("");
+      logScan(match(id), id);
       return true;
     }
-    if (barcodeId) { barcodeId.retried = true; logScan(match(barcodeId), barcodeId); return true; }
-    // not accepted: tell the operator what was seen, and catch IDs of people not on the sheet
-    const letters = (text.match(/[A-Za-z]/g) || []).length;
-    const guess = !id.key && looksLikeId(text) ? guessName(text) : null;
-    if (res.p) ocrHint = `Close to ${res.p.name} — hold steady, closer`;
-    else if (/<<</.test(text)) ocrHint = "Passport code seen — hold steady, no glare";
-    else if (guess && id.dates.length) {
-      const k = norm(guess.last + "|" + guess.first);
-      if (k === lastStranger || fromPhoto) {
-        // same name read twice and nobody on the sheet comes close
-        Object.assign(id, guess, { kind: "ID front (text read)", key: "ocrnm:" + k });
-        ocrQuietUntil = Date.now() + 3000; ocrHint = ""; lastStranger = "";
-        logScan(res, id);
-        return true;
-      }
-      lastStranger = k;
-      ocrHint = `Saw ${guess.first} ${guess.last} — checking…`;
-    } else if (letters < 12) ocrHint = "No text seen — hold card closer, flat, no glare";
-    else ocrHint = "No trip-sheet name read — move closer";
-    if (!fromPhoto) ocrState(ocrHint);
+    if (!fromPhoto) ocrState(/<{4,}/.test(text) ? "Passport code seen — hold steady, no glare" : "");
     return false;
   } catch (e) {
     console.warn(e);
-    if (fromPhoto) toast(`Text reading failed: ${e.message || e}`);
-    if (barcodeId) { barcodeId.retried = true; logScan(match(barcodeId), barcodeId); return true; }
+    if (fromPhoto) toast(`Passport reading failed: ${e.message || e}`);
     return false;
   } finally {
     ocrBusy = false; lastOcrAt = Date.now();
-    if (!ocrHint || !stream) ocrState("");
   }
 }
 const ocrCanvas = document.createElement("canvas");
@@ -571,7 +523,7 @@ async function startCam() {
       sel.hidden = cams.length < 2;
     } catch {}
     $("#scanBtn").textContent = "Stop camera";
-    initOCR().catch((e) => ocrState(`Text reading unavailable: ${e.message}`));
+    initOCR().catch((e) => ocrState(`Passport reading unavailable: ${e.message}`));
     resumeScan();
   } catch (e) {
     $("#camErr").hidden = false;
@@ -581,7 +533,7 @@ async function startCam() {
 function stopCam() {
   pauseScan();
   if (stream) stream.getTracks().forEach((t) => t.stop());
-  stream = null; ocrHint = ""; ocrState(""); $("#cam").hidden = true; $("#scanBtn").textContent = "Start camera";
+  stream = null; ocrState(""); $("#cam").hidden = true; $("#scanBtn").textContent = "Start camera";
 }
 function pauseScan() { scanning = false; clearTimeout(timer); }
 function resumeScan() { if (!stream) return; scanning = true; tick(); }
@@ -598,8 +550,8 @@ async function tick() {
       const img = ctx.getImageData(0, 0, c.width, c.height);
       const res = await readBarcodes(img, { formats: FORMATS, tryHarder: true, maxNumberOfSymbols: 1, textMode: "Plain" });
       const now = Date.now();
-      if (res.length && res[0].text) handleScan(res[0].text, visibleFrame(v));
-      else if (!ocrBusy && now - lastOcrAt > 1200 && now > ocrQuietUntil) runOCR(visibleFrame(v));
+      if (res.length && res[0].text) handleScan(res[0].text);
+      else if (!ocrBusy && now - lastOcrAt > 1000 && now > ocrQuietUntil) readPassport(visibleFrame(v));
     } catch (e) { console.warn(e); }
     busy = false;
   }
@@ -616,26 +568,87 @@ async function scanPhoto(file) {
   $("#busy").hidden = false;
   try {
     const res = await readBarcodes(file, { formats: FORMATS, tryHarder: true, maxNumberOfSymbols: 1, textMode: "Plain" });
-    const img = await fileToImageData(file);
-    if (res.length && res[0].text) { lastScanText = ""; await handleScan(res[0].text, img, true); return; }
-    if (!(await runOCR(img, null, true)))
-      toast(`${ocrHint || "Couldn't read a trip-sheet name from that photo"}. Fill the frame with the ID or passport photo page, good light — or check by eye and tap the passenger to board.`);
+    if (res.length && res[0].text) { lastScanText = ""; handleScan(res[0].text); return; }
+    if (!(await readPassport(await fileToImageData(file), true)))
+      toast("No license barcode or passport code found. Photograph the barcode on the back of the license, or the passport photo page with the <<< lines — or check by eye and tap the passenger to board.");
   } finally { $("#busy").hidden = true; }
+}
+
+// ---------- trip sheet text reading (photos, scanned PDFs) ----------
+function busyMsg(msg) { const b = $("#busy"); b.textContent = msg || "Working…"; b.hidden = !msg; }
+// fix the usual OCR slips in "Jane Doe (Female - 3/7/81)" lines
+function cleanSheetText(text) {
+  return text.split(/\n/).map((l) => l
+    .replace(/[{\[]/g, "(").replace(/[}\]]/g, ")").replace(/[–—~=]/g, "-")
+    .replace(/\bF[eao][mn]?[mn]a[l1I|i]e\b/gi, "Female").replace(/\bMa[l1I|i]e\b/gi, "Male")
+    .replace(/\((\s*(?:Male|Female|Unspecified|Undisclosed|X)\s*-\s*)([0-9OoIl|\/ ]{6,12})\)?/g, (m, g, d) =>
+      `(${g}${d.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1").replace(/\s+/g, "")})`)
+  ).join("\n");
+}
+// keep only what the parser needs, so the operator can proof-read it in the paste box
+function sheetLines(text) {
+  const out = [];
+  for (const l of cleanSheetText(text).split("\n")) {
+    if (/Crew Itinerary|\bLeg\s*\d/i.test(l)) { out.push(l.trim()); continue; }
+    PAX_RE.lastIndex = 0; let m;
+    while ((m = PAX_RE.exec(l))) {
+      const primary = /Primary/i.test(l.slice(m.index + m[0].length, m.index + m[0].length + 14)) ? " Primary" : "";
+      out.push(`${m[1].replace(/^Pax\s*\(\d+\)\s*/, "").trim()} (${m[2]} - ${m[3]}/${m[4]}/${m[5]})${primary}`);
+    }
+  }
+  return out.join("\n");
+}
+async function readTripSheetImages(images) {
+  let text = "";
+  for (let i = 0; i < images.length; i++) {
+    busyMsg(`Reading trip sheet ${images.length > 1 ? `page ${i + 1} of ${images.length}` : ""}… (can take ~10 s)`);
+    text += (await ocrImage(enhance(await images[i](), 0.001))) + "\n";
+  }
+  const lines = sheetLines(text);
+  const t = parseManifest(lines.split("\n"));
+  const n = t.legs.reduce((a, l) => a + l.pax.length, 0);
+  $("#paste").value = lines;
+  if (!n) return toast("Couldn't find passenger lines in that. Take the photo straight on, sheet filling the frame, good light — or type the list.");
+  $("#paste").scrollIntoView({ behavior: "smooth", block: "center" });
+  toast(`Read ${n} passenger${n > 1 ? "s" : ""}. Check names and birth dates against the sheet, fix any typos, then tap "Use pasted list".`);
+}
+async function loadSheetPhotos(files) {
+  if (!files.length) return;
+  try { await readTripSheetImages([...files].map((f) => () => fileToImageData(f, 2400))); }
+  catch (e) { toast(`Trip sheet reading failed: ${e.message || e}`); }
+  finally { busyMsg(""); }
+}
+async function renderPdfPages(buf) {
+  const doc = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false }).promise;
+  const pages = [];
+  for (let p = 1; p <= doc.numPages; p++) pages.push(async () => {
+    const page = await doc.getPage(p);
+    const vp0 = page.getViewport({ scale: 1 });
+    const vp = page.getViewport({ scale: Math.min(3, 2400 / vp0.width) });
+    const c = document.createElement("canvas"); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    return ctx.getImageData(0, 0, c.width, c.height);
+  });
+  return pages;
 }
 
 // ---------- wiring ----------
 async function loadPdf(file) {
-  $("#busy").hidden = false;
+  busyMsg("Working…");
   try {
     const buf = new Uint8Array(await file.arrayBuffer());
-    const t = parseManifest(await pdfToLines(buf));
-    if (!t.legs.length) throw new Error("No passengers found in that PDF.");
-    trip = t; legIdx = 0; render();
+    const t = parseManifest(await pdfToLines(buf.slice()));
+    if (t.legs.length) { trip = t; legIdx = 0; render(); return; }
+    // no text layer (scanned / photographed PDF): read the page images
+    await readTripSheetImages(await renderPdfPages(buf));
   } catch (e) { toast(e.message || e); }
-  finally { $("#busy").hidden = true; }
+  finally { busyMsg(""); }
 }
 window.addEventListener("DOMContentLoaded", () => {
   $("#pdf").onchange = (e) => loadPdf(e.target.files[0]);
+  $("#sheetPhoto").onchange = (e) => { loadSheetPhotos(e.target.files); e.target.value = ""; };
   $("#pasteGo").onclick = () => {
     const t = parsePasted($("#paste").value);
     if (!t.legs.length) return toast("No passengers found. Lines should look like: Jane Doe (Female - 3/7/81)");
@@ -657,4 +670,4 @@ window.addEventListener("DOMContentLoaded", () => {
 });
 
 // test hook (no effect in normal use)
-window.__idcheck = { pdfToLines, parseAAMVA, ocrToId, parseMRZ, runOCR, parseGeneric, parseManifest, match, handleScan, scanPhoto, loadPdf, get trip() { return trip; } };
+window.__idcheck = { pdfToLines, parseAAMVA, parseMRZ, readPassport, cleanSheetText, sheetLines, loadSheetPhotos, parseGeneric, parseManifest, match, handleScan, scanPhoto, loadPdf, get trip() { return trip; } };
