@@ -243,16 +243,20 @@ function match(id) {
     const score = n.s + (dobOk ? 40 : 0) + (id.gender && gOk ? 5 : 0);
     if (!best || score > best.score) best = { p, n, dobOk, gOk, score };
   }
-  if (!best || best.score < 40) return { level: "red", title: "NOT ON MANIFEST", reasons: ["No passenger on this leg matches this ID."] };
-  const r = [], warn = [];
+  const warn = [];
+  if (id.expired) warn.push(`ID EXPIRED ${fmtDate(id.exp)}`);
+  if (id.realId === "No") warn.push("Not REAL ID compliant");
+  if (!best || best.score < 40) {
+    if (id.tokens) return { level: "red", title: "NOT ON MANIFEST", reasons: ["Badge barcode doesn't match anyone on this leg."], warn: [] };
+    return { level: "add", title: "ADD TO TRIP", reasons: ["Not on this leg's trip sheet — noted under “To add to trip”."], warn };
+  }
+  const r = [];
   const { n, dobOk, gOk, p } = best;
   r.push(n.lastHit ? "✓ Last name" : n.lastPartial ? "~ Last name partial" : "✗ Last name");
   r.push(n.firstOk ? "✓ First name" : n.firstPrefix ? "~ First name similar (nickname/short?)" : "✗ First name");
   const hasDob = !!(id.dob || (id.dates && id.dates.length));
   r.push(dobOk ? "✓ DOB" : hasDob ? `✗ DOB (ID ${fmtDate(id.dob || id.dates[0])} vs manifest ${fmtDate(p.dob)})` : "— DOB not in barcode");
   if (id.gender) r.push(gOk ? "✓ Gender" : `✗ Gender (ID ${id.gender} vs manifest ${p.gender})`);
-  if (id.expired) warn.push(`ID EXPIRED ${fmtDate(id.exp)}`);
-  if (id.realId === "No") warn.push("Not REAL ID compliant");
   let level;
   if (n.lastHit && n.firstOk && dobOk && gOk && !warn.length) level = "green";
   else if (hasDob && !dobOk && n.lastHit) level = "red";
@@ -270,7 +274,8 @@ function render() {
   const leg = trip.legs[legIdx];
   const boarded = leg.pax.filter((p) => p.status === "boarded").length;
   $("#tripTitle").textContent = `${trip.id || "Trip"} · Leg ${leg.n} ${leg.route}`;
-  $("#count").textContent = `${boarded} / ${leg.expected}`;
+  const toAddN = (leg.scans || []).filter(isToAdd).length;
+  $("#count").textContent = `${boarded} / ${leg.expected}${toAddN ? ` +${toAddN}` : ""}`;
   $("#count").className = boarded === leg.expected ? "count done" : "count";
   const sel = $("#leg");
   sel.hidden = trip.legs.length < 2;
@@ -278,15 +283,16 @@ function render() {
   const q = norm($("#search").value);
   const scans = leg.scans || [];
   const hit = (txt) => !q || norm(txt).includes(q);
-  const notOn = scans.filter((sc) => !sc.res.p);
-  const mism = scans.filter((sc) => sc.res.p && sc.res.level !== "green" && !sc.resolved);
+  const toAdd = scans.filter(isToAdd);
+  const notOn = scans.filter((sc) => !sc.res.p && sc.res.level === "red");
+  const mism = scans.filter((sc) => sc.res.p && sc.res.level !== "green" && !sc.resolved && !sc.toAdd);
   const mismPax = new Set(mism.map((sc) => sc.res.p));
   const notHere = leg.pax.filter((p) => p.status !== "boarded" && !mismPax.has(p));
   const board = leg.pax.filter((p) => p.status === "boarded");
   $("#cBoard").textContent = `${board.length}/${leg.expected}`;
   $("#cNotHere").textContent = notHere.length;
   $("#cMism").textContent = mism.length;
-  $("#cNotOn").textContent = notOn.length;
+  $("#cAdd").textContent = toAdd.length;
   const scanLi = (sc, lvl, sub) => {
     const li = document.createElement("li"); li.className = lvl;
     const who = sc.res.p ? sc.res.p.name : idLabel(sc.id);
@@ -302,6 +308,14 @@ function render() {
     li.onclick = () => manualSheet(p); return li;
   };
   const fill = (id, arr, fn) => { const ul = $(id); ul.innerHTML = ""; arr.forEach((x) => ul.appendChild(fn(x))); ul.parentElement.hidden = !arr.length; };
+  fill("#lAdd", toAdd.filter((sc) => hit(idLabel(sc.id))), (sc) => {
+    const li = document.createElement("li"); li.className = "add";
+    const warn = (sc.res.warn || []).length ? " · ⚠ " + sc.res.warn.join(", ") : "";
+    li.innerHTML = `<div class="nm"><b>${esc(titleCase(idLabel(sc.id)))}</b></div>
+      <div class="meta">${sc.id.gender || "?"} · DOB ${fmtDate(sc.id.dob)} · ${esc(srcName(sc.id))}${sc.res.p ? ` · not ${esc(sc.res.p.name)}` : ""}${esc(warn)}</div><div class="st">+</div>`;
+    li.onclick = () => detailSheet(sc); return li;
+  });
+  $("#copyAdd").onclick = () => copyAddList(leg, toAdd);
   fill("#lNotOn", notOn.filter((sc) => hit(idLabel(sc.id))), (sc) => scanLi(sc, "red", "NOT ON TRIP SHEET"));
   fill("#lMism", mism.filter((sc) => hit(sc.res.p.name)), (sc) => scanLi(sc, sc.res.level === "red" ? "red" : "yellow",
     sc.res.reasons.filter((r) => !r.startsWith("✓")).concat(sc.res.warn || []).join(" · ") || "Check by eye"));
@@ -324,7 +338,7 @@ let actx = null;
 function beep(level) {
   try {
     actx = actx || new (window.AudioContext || window.webkitAudioContext)();
-    const tones = level === "green" ? [[880, 0.09]] : level === "yellow" ? [[660, 0.12], [660, 0.12]] : [[220, 0.35]];
+    const tones = level === "green" ? [[880, 0.09]] : level === "yellow" ? [[660, 0.12], [660, 0.12]] : level === "add" ? [[523, 0.1], [784, 0.14]] : [[220, 0.35]];
     let t = actx.currentTime;
     for (const [f, d] of tones) {
       const o = actx.createOscillator(), g = actx.createGain();
@@ -362,40 +376,50 @@ function logScan(res, id) {
   render();
 }
 
-function renderScans() {
-  const leg = trip.legs[legIdx];
-  const scans = leg.scans || [];
-  const ul = $("#scans");
-  $("#scanHdr").textContent = scans.length ? `Scanned (${scans.length}) — ${scans.filter((s) => s.res.level === "red").length} not on sheet` : "Scanned — none yet";
-  ul.innerHTML = "";
-  scans.forEach((sc) => {
-    const li = document.createElement("li");
-    const lvl = sc.res.p && sc.res.p.status === "boarded" && sc.res.level !== "red" ? "green" : sc.res.level;
-    li.className = lvl;
-    const who = sc.res.p ? sc.res.p.name : idLabel(sc.id);
-    const sub = lvl === "green" ? "On trip sheet ✓" : lvl === "yellow" ? "Close match — tap to check" : sc.res.p ? `Mismatch vs ${sc.res.p.name} — tap` : "NOT ON TRIP SHEET";
-    li.innerHTML = `<div class="nm"><b>${esc(who)}</b></div><div class="meta">${esc(sub)} · ${pad(sc.t.getHours())}:${pad(sc.t.getMinutes())}</div><div class="st">${lvl === "green" ? "✓" : lvl === "yellow" ? "?" : "✗"}</div>`;
-    li.onclick = () => detailSheet(sc);
-    ul.appendChild(li);
-  });
+const isToAdd = (sc) => sc.toAdd || sc.res.level === "add";
+const titleCase = (s) => s.toLowerCase().replace(/(^|[\s'-])([a-z])/g, (m, a, b) => a + b.toUpperCase());
+const genderWord = (g) => (g === "M" ? "Male" : g === "F" ? "Female" : "Unspecified");
+async function copyAddList(leg, list) {
+  // same "Name (Gender - m/d/yyyy)" format as the trip sheet, ready to send to dispatch
+  const lines = list.map((sc) => `${titleCase(idLabel(sc.id))} (${genderWord(sc.id.gender)} - ${fmtDate(sc.id.dob)})`);
+  const text = `Add to ${trip.id || "trip"} · Leg ${leg.n} ${leg.route}:\n` + lines.join("\n");
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch {}
+    ta.remove();
+  }
+  toast(`Copied ${lines.length} name${lines.length === 1 ? "" : "s"} — paste into a message to dispatch.`);
+}
+// destructive buttons need a second tap within 4 s
+function confirmTap(btn, label, fn) {
+  if (!btn) return;
+  const orig = btn.textContent;
+  btn.onclick = () => {
+    if (!btn.dataset.armed) { btn.dataset.armed = "1"; btn.textContent = label; setTimeout(() => { delete btn.dataset.armed; btn.textContent = orig; }, 4000); return; }
+    fn();
+  };
 }
 
 function detailSheet(sc) {
   const { res, id } = sc;
   const box = $("#result");
-  box.className = `result ${res.level}`;
+  const adding = isToAdd(sc);
+  box.className = `result ${adding ? "add" : res.level}`;
   const idName = id.tokens ? "" : idLabel(id);
   box.innerHTML = `
-    <div class="big">${res.title}</div>
+    <div class="big">${adding ? "ADD TO TRIP" : res.title}</div>
     ${res.p ? `<div class="who">${esc(res.p.name)}<br><small>Trip sheet: ${res.p.gender} · ${fmtDate(res.p.dob)}</small></div>` : ""}
     <div class="idinfo"><small>${esc(id.kind)}${idName ? `: ${esc(idName)}` : ""}${id.dob ? ` · ${fmtDate(id.dob)}` : ""}${id.gender ? ` · ${id.gender}` : ""}${id.realId ? ` · REAL ID: ${id.realId}` : ""}${id.exp ? ` · exp ${fmtDate(id.exp)}` : ""}</small></div>
     <ul>${res.reasons.map((r) => `<li>${esc(r)}</li>`).join("")}${(res.warn || []).map((w) => `<li class="w">⚠ ${esc(w)}</li>`).join("")}</ul>
     <div class="btns">
       ${res.p && res.p.status === "boarded" && res.level !== "green" && !sc.resolved ? `<div class="w">⚠ ${esc(res.p.name)} is already boarded — this may be a different person or a duplicate.</div><button id="rOk" class="sec">Dismiss (resolved)</button>` : ""}
-      ${res.p && res.p.status !== "boarded" ? `<button id="rBoard">Verified by eye — board</button>` : ""}
+      ${res.p && res.p.status !== "boarded" && !sc.toAdd ? `<button id="rBoard">Verified by eye — board</button>` : ""}
+      ${res.p && res.level !== "green" && !sc.toAdd ? `<button id="rAdd" class="sec">Different person — add to trip</button>` : ""}
+      ${sc.toAdd ? `<button id="rUnAdd" class="sec">Undo “add to trip”</button>` : ""}
       ${res.p && res.p.status === "boarded" ? `<button id="rUndo" class="sec">Un-board</button>` : ""}
       ${id.raw ? `<button id="rRaw" class="sec">${id.mrz ? "Show passport code" : "Show barcode text"}</button>` : ""}
-      <button id="rDel" class="sec">Remove scan</button>
+      <button id="rDel" class="sec">Erase this scan</button>
       <button id="rNext">Close</button>
     </div>
     <pre id="rawTxt" hidden></pre>`;
@@ -405,7 +429,9 @@ function detailSheet(sc) {
   const u = $("#rUndo"); if (u) u.onclick = () => { res.p.status = "pending"; res.p.how = ""; sc.resolved = false; box.hidden = true; render(); };
   const ok = $("#rOk"); if (ok) ok.onclick = () => { sc.resolved = true; box.hidden = true; render(); };
   const rr = $("#rRaw"); if (rr) rr.onclick = () => { const t = $("#rawTxt"); t.textContent = id.raw; t.hidden = !t.hidden; };
-  $("#rDel").onclick = () => { leg.scans = leg.scans.filter((x) => x !== sc); box.hidden = true; render(); };
+  const ad = $("#rAdd"); if (ad) ad.onclick = () => { sc.toAdd = true; box.hidden = true; render(); };
+  const ua = $("#rUnAdd"); if (ua) ua.onclick = () => { sc.toAdd = false; box.hidden = true; render(); };
+  confirmTap($("#rDel"), "Tap again to erase", () => { leg.scans = leg.scans.filter((x) => x !== sc); box.hidden = true; render(); });
   $("#rNext").onclick = () => { box.hidden = true; };
 }
 
@@ -513,11 +539,20 @@ function manualSheet(p) {
     <div class="btns">
       ${p.status !== "boarded" ? `<button id="mB">Verified — board</button>` : `<button id="mU" class="sec">Un-board</button>`}
       <button id="mF" class="sec">Flag (problem)</button>
+      <button id="mX" class="sec">Remove from trip</button>
       <button id="mC" class="sec">Close</button></div>`;
   box.hidden = false;
   const mb = $("#mB"); if (mb) mb.onclick = () => { p.status = "boarded"; p.how = "manual"; box.hidden = true; render(); };
   const mu = $("#mU"); if (mu) mu.onclick = () => { p.status = "pending"; p.how = ""; box.hidden = true; render(); };
   $("#mF").onclick = () => { p.status = "flagged"; p.how = "flagged"; box.hidden = true; render(); };
+  confirmTap($("#mX"), "Tap again to remove", () => {
+    // not flying: drop them from this leg (and any scans matched to them) and from memory
+    const leg = trip.legs[legIdx];
+    leg.pax = leg.pax.filter((x) => x !== p);
+    leg.expected = Math.max(leg.pax.length, (leg.expected || 0) - 1);
+    leg.scans = (leg.scans || []).filter((sc) => sc.res.p !== p);
+    box.hidden = true; render();
+  });
   $("#mC").onclick = () => { box.hidden = true; };
 }
 

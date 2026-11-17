@@ -41,6 +41,7 @@
   .result.green { background:#0f3d24; border:3px solid var(--g); }
   .result.yellow { background:#3d3305; border:3px solid var(--y); }
   .result.red { background:#4a1414; border:3px solid var(--r); }
+  .result.add { background:#0f2a4a; border:3px solid var(--ac); }
   .result.manual { background:var(--card); border:3px solid var(--ac); }
   .result .big { font-size:30px; font-weight:900; letter-spacing:.5px; }
   .result .who { font-size:20px; font-weight:700; margin:6px 0; }
@@ -52,19 +53,20 @@
   .chips { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin:6px 0; }
   .chip { text-decoration:none; color:var(--tx); background:var(--card); border-radius:10px; padding:6px 4px; text-align:center; font-size:12px; border-top:4px solid; }
   .chip b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
-  .chip.g { border-color:var(--g); } .chip.n { border-color:#6b7785; } .chip.y { border-color:var(--y); } .chip.r { border-color:var(--r); }
+  .chip.a { border-color:var(--ac); } .chip.g { border-color:var(--g); } .chip.n { border-color:#6b7785; } .chip.y { border-color:var(--y); } .chip.r { border-color:var(--r); }
   .sec h2 { font-size:15px; margin:14px 0 4px; text-transform:uppercase; letter-spacing:.5px; }
-  .sec.r h2 { color:#ff6b6b; } .sec.y h2 { color:#ffd166; } .sec.n h2 { color:var(--mut); } .sec.g h2 { color:#4ade80; }
+  .sec.a h2 { color:#7fb2ff; } .sec.r h2 { color:#ff6b6b; } .sec.y h2 { color:#ffd166; } .sec.n h2 { color:var(--mut); } .sec.g h2 { color:#4ade80; }
   ul.lst { list-style:none; padding:0; margin:0; }
   .lst li { display:grid; grid-template-columns:1fr auto; grid-template-areas:"nm st" "meta st"; background:var(--card); border-radius:10px; padding:10px 12px; margin:6px 0; border-left:6px solid #2c3640; cursor:pointer; }
   .lst li.green { border-left-color:var(--g); } .lst li.green .st { color:var(--g); }
   .lst li.yellow { border-left-color:var(--y); background:#2e2a12; } .lst li.yellow .st { color:var(--y); }
   .lst li.red { border-left-color:var(--r); background:#3a1717; } .lst li.red .st { color:var(--r); }
   .lst li.flagged { border-left-color:var(--r); }
+  .lst li.add { border-left-color:var(--ac); background:#13243a; } .lst li.add .st { color:#7fb2ff; }
   .lst .nm { grid-area:nm; } .lst .meta { grid-area:meta; color:var(--mut); font-size:13px; }
   .lst .st { grid-area:st; font-size:26px; font-weight:800; align-self:center; padding-left:8px; }
   .flash { position:fixed; left:50%; transform:translateX(-50%); top:12px; width:min(560px,94vw); padding:14px; border-radius:12px; font-size:20px; font-weight:800; text-align:center; z-index:35; box-shadow:0 6px 24px #000a; }
-  .flash.green { background:var(--g); } .flash.yellow { background:var(--y); color:#111; } .flash.red { background:var(--r); }
+  .flash.add { background:var(--ac); } .flash.green { background:var(--g); } .flash.yellow { background:var(--y); color:#111; } .flash.red { background:var(--r); }
   @media (min-width:900px) and (orientation:landscape) {
     #trip { display:grid; grid-template-columns:minmax(380px,42%) 1fr; gap:16px; align-items:start; }
     #trip header { position:sticky; top:0; }
@@ -113,12 +115,13 @@
       <a href="#sBoard" class="chip g"><b id="cBoard">0</b>Boarded</a>
       <a href="#sNotHere" class="chip n"><b id="cNotHere">0</b>Not here</a>
       <a href="#sMism" class="chip y"><b id="cMism">0</b>Mismatch</a>
-      <a href="#sNotOn" class="chip r"><b id="cNotOn">0</b>Not on sheet</a>
+      <a href="#sAdd" class="chip a"><b id="cAdd">0</b>To add</a>
     </div>
     <input id="search" type="search" placeholder="Search name…">
   </header>
   <div id="flash" class="flash" hidden></div>
   <div class="cols">
+    <section id="sAdd" class="sec a" hidden><h2>To add to trip <button id="copyAdd" class="sec" style="padding:6px 10px;font-size:13px;margin-left:8px;vertical-align:middle">Copy list</button></h2><ul id="lAdd" class="lst"></ul></section>
     <section id="sNotOn" class="sec r" hidden><h2>Not on trip sheet</h2><ul id="lNotOn" class="lst"></ul></section>
     <section id="sMism" class="sec y" hidden><h2>Mismatch — check by eye</h2><ul id="lMism" class="lst"></ul></section>
     <section id="sNotHere" class="sec n" hidden><h2>Not here yet</h2><ul id="lNotHere" class="lst"></ul></section>

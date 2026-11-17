@@ -8,7 +8,9 @@ Single-page web app for checking passenger IDs at the airstair against a JetInsi
 - Scan each passenger with the live camera (or a photo):
   - the PDF417 barcode on the back of a US driver's license / REAL ID,
   - the machine-readable zone (the `<<<` lines) on a passport photo page or US passport card. Birth and expiry dates are validated by their check digits; names are matched tolerantly against the trip sheet.
-- Passengers sort into **Boarded**, **Not here yet**, **Mismatch** (name matches but DOB/gender differs, expired, not REAL ID) and **Not on trip sheet**.
+- Passengers sort into **Boarded**, **Not here yet**, **Mismatch** (name matches but DOB/gender differs, expired, not REAL ID) and **To add to trip**.
+- Anyone scanned is assumed to be flying: a license or passport that isn't on the leg's trip sheet goes to **To add to trip** (blue). A mismatch can be moved there with *Different person — add to trip*. **Copy list** copies them as `Name (Gender - m/d/yyyy)` lines to send to dispatch.
+- Tap any trip-sheet passenger to remove them from the trip, or any scan to erase it (second tap confirms). Removed people are dropped from memory.
 
 Everything runs on the device, in memory. No data is saved or sent; a Content-Security-Policy blocks all network access. Scanning does not replace comparing the ID photo to the person.
 
