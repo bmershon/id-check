@@ -335,6 +335,14 @@ function idLabel(id) {
   return [id.first, id.middle, id.last].filter(Boolean).join(" ");
 }
 let actx = null;
+function unlockAudio() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === "suspended") actx.resume();
+    const b = actx.createBuffer(1, 1, 22050), s = actx.createBufferSource();
+    s.buffer = b; s.connect(actx.destination); s.start(0);
+  } catch {}
+}
 function beep(level) {
   try {
     actx = actx || new (window.AudioContext || window.webkitAudioContext)();
@@ -581,6 +589,12 @@ async function startCam() {
       const sel = $("#camSel");
       sel.innerHTML = cams.map((c, i) => `<option value="${c.deviceId}" ${c.deviceId === curId ? "selected" : ""}>${esc(c.label || "Camera " + (i + 1))}</option>`).join("");
       sel.hidden = cams.length < 2;
+      // Some Android phones open the fixed-focus ultra-wide back camera first: switch to the main one once
+      const cur = cams.find((c) => c.deviceId === curId);
+      if (!devId && !startCam._switched && cur && /ultra|wide.?angle|0[.,]5x/i.test(cur.label)) {
+        const main = cams.find((c) => /back|rear|environment|facing back/i.test(c.label) && !/ultra|wide.?angle|tele|0[.,]5x|[23]x/i.test(c.label));
+        if (main) { startCam._switched = true; sel.value = main.deviceId; stopCam(); return startCam(); }
+      }
     } catch {}
     $("#scanBtn").textContent = "Stop camera";
     initOCR().catch((e) => ocrState(`Passport reading unavailable: ${e.message}`));
@@ -717,9 +731,10 @@ window.addEventListener("DOMContentLoaded", () => {
   };
   $("#search").oninput = render;
   $("#leg").onchange = (e) => { legIdx = +e.target.value; render(); };
-  $("#scanBtn").onclick = () => (stream ? stopCam() : startCam());
+  $("#scanBtn").onclick = () => { unlockAudio(); stream ? stopCam() : startCam(); };
   $("#torch").onclick = toggleTorch;
   $("#camSel").onchange = () => { if (stream) { stopCam(); startCam(); } };
+  $("#photo").onclick = unlockAudio;
   $("#photo").onchange = (e) => { scanPhoto(e.target.files[0]); e.target.value = ""; };
   $("#close").onclick = () => {
     const btn = $("#close");

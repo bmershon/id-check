@@ -27,4 +27,4 @@ npm run build   # downloads the OCR model once into build/, writes index.html fr
 
 `test/` holds synthetic (fake) license and badge barcodes for testing.
 
-OCR (passports, trip-sheet photos) needs iOS/iPadOS 16.4+ (WebAssembly SIMD).
+Works in Safari and Chrome on iPhone, iPad and Android, and on laptops with a webcam (a fixed-focus laptop webcam may struggle with license barcodes; use **Take photo of ID** or a phone). OCR (passports, trip-sheet photos) needs iOS/iPadOS 16.4+ (WebAssembly SIMD); any current Android Chrome or desktop browser has it.
