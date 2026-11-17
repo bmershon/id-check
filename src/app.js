@@ -77,7 +77,47 @@ async function pdfToLines(buf) {
 const PAX_RE =
   /([A-Za-zÀ-ɏ][A-Za-zÀ-ɏ'.\- ]+?)\s*\(\s*(Male|Female|Unspecified|Undisclosed|X)\s*[-–—]\s*(\d{1,2})\/(\d{1,2})\/(\d{2,4})\s*\)/g;
 
+// looser fallback for OCR'd / oddly extracted lines: missing or misread parenthesis, odd dash, spaced date
+const LOOSE_RE =
+  /([A-Za-zÀ-ɏ][A-Za-zÀ-ɏ'.\- ]+?)\s*[(\[{|]?\s*(MALE|Male|male|FEMALE|Female|female|Unspecified|Undisclosed|X)\s*[-–—~=:,.]?\s*(\d{1,2})\s*[\/.\-]\s*(\d{1,2})\s*[\/.\-]\s*(\d{2,4})\b\s*\)?/g;
+const GENDER_START = /^\s*[(\[{]?\s*(Male|Female|Unspecified|Undisclosed|X)\b/i;
+// common OCR misreads of the gender word: Fernale, Femaie, Fema1e, Maie, Mo1e …
+const fixGender = (s) => s.replace(/\bF[eao][mnr]{0,2}[mn]?a[l1I|it]e\b/gi, "Female").replace(/\bM[ao][l1I|i]e\b/gi, "Male");
+// passenger entries in one line: strict pattern first, loose fallback only if nothing matched
+function paxInLine(s) {
+  const out = [];
+  for (const [re, line] of [[PAX_RE, s], [LOOSE_RE, fixGender(s)]]) {
+    re.lastIndex = 0; let m;
+    while ((m = re.exec(line))) {
+      const name = m[1].replace(/^.*\bPax\s*\(\d+\)\s*/i, "").replace(/\s+/g, " ").trim()
+        .replace(/\s+[Cc(|]$/, ""); // "Noah Davis CMale": a misread "(" stuck to the gender word
+      const after = line.slice(m.index + m[0].length, m.index + m[0].length + 14);
+      if (name.replace(/[^A-Za-zÀ-ɏ]/g, "").length >= 2)
+        out.push({ name, g: G(m[2]), gw: m[2][0].toUpperCase() + m[2].slice(1).toLowerCase(), m: +m[3], d: +m[4], y: yy2yyyy(m[5]), primary: /Primary/i.test(after) });
+    }
+    if (out.length) break;
+  }
+  return out.filter((x) => x.m >= 1 && x.m <= 12 && x.d >= 1 && x.d <= 31);
+}
+// an entry split across two lines ("Jane Ann Doe" / "(Female - 3/7/81)") is rejoined
+function joinWrapped(lines) {
+  const out = [];
+  for (const l of lines) {
+    const prev = out.length ? out[out.length - 1] : null;
+    if (prev != null && !/^\s*$/.test(prev) && !paxInLine(prev).length &&
+        (GENDER_START.test(l) || /\(\s*(Male|Female|Unspecified|Undisclosed|X)?\s*[-–—]?\s*$/i.test(prev) || /^\s*\d{1,2}\/\d{1,2}\/\d{2,4}\s*\)/.test(l)))
+      out[out.length - 1] = prev.trimEnd() + " " + l.trim();
+    else out.push(l);
+  }
+  return out;
+}
+// a line that looks like a passenger (date + parenthesis, not a schedule line) but didn't parse
+const looksLikePax = (l) =>
+  /\d{1,2}\s*[\/.\-]\s*\d{1,2}\s*[\/.\-]\s*\d{2,4}/.test(l) && /[(\[{|C]\s*[MFX][a-z0-9|]{0,7}\s*[-–—~=:]|male|female/i.test(l) &&
+  !/\bLeg\b|\bDep\b|\bArr\b|\bET[AD]\b|\b\d{1,2}:\d{2}\b|Itinerary|Printed|Page \d/i.test(l) && !paxInLine(l).length;
+
 function parseManifest(lines) {
+  lines = joinWrapped(lines.filter((l) => !/^\s*\?\?/.test(l)));
   const text = lines.join("\n");
   const idm = text.match(/Crew Itinerary\s*\(([A-Z0-9]+)\)/) || text.match(/\(([A-Z0-9]{5,8})\)/);
   const legs = [];
@@ -99,20 +139,17 @@ function parseManifest(lines) {
     if (m) { const l = ensureLeg(+m[1]); l.expected = +m[2]; }
     m = s.match(/\bPax\s*\((\d+)\)/);
     if (m && cur && cur.expected == null) cur.expected = +m[1];
-    PAX_RE.lastIndex = 0;
-    let pm;
-    while ((pm = PAX_RE.exec(s))) {
+    for (const x of paxInLine(s)) {
       if (!cur) cur = ensureLeg(1);
-      const name = pm[1].replace(/^Pax\s*\(\d+\)\s*/, "").trim();
-      const t = name.split(/\s+/);
+      const t = x.name.split(/\s+/);
       cur.pax.push({
-        name,
+        name: x.name,
         first: t[0],
         last: t[t.length - 1],
         middle: t.slice(1, -1).join(" "),
-        gender: G(pm[2]),
-        dob: { m: +pm[3], d: +pm[4], y: yy2yyyy(pm[5]) },
-        primary: /Primary/i.test(s.slice(pm.index + pm[0].length, pm.index + pm[0].length + 12)),
+        gender: x.g,
+        dob: { m: x.m, d: x.d, y: x.y },
+        primary: x.primary,
         status: "pending", // pending | boarded | flagged
         how: "",
         note: "",
@@ -123,7 +160,22 @@ function parseManifest(lines) {
     l.pax.sort((a, b) => norm(a.last).localeCompare(norm(b.last)) || norm(a.first).localeCompare(norm(b.first)));
     if (l.expected == null) l.expected = l.pax.length;
   });
-  return { id: idm ? idm[1] : "", legs: legs.filter((l) => l.pax.length) };
+  return { id: idm ? idm[1] : "", legs: legs.filter((l) => l.pax.length), unparsed: lines.filter(looksLikePax).map((l) => l.trim()) };
+}
+// "Leg 1: 23 of 28" for legs where the sheet's own count is higher than what was read
+const shortLegs = (t) => t.legs.filter((l) => l.expected > l.pax.length).map((l) => `Leg ${l.n}: ${l.pax.length} of ${l.expected}`);
+// canonical, proof-readable passenger list for the paste box; unreadable passenger-like lines marked "??"
+function sheetToPaste(lines) {
+  const out = [];
+  for (const l of joinWrapped(lines)) {
+    if (/Crew Itinerary|\bLeg\s*\d/i.test(l)) { out.push(l.trim()); continue; }
+    const pc = l.match(/\bPax\s*\((\d+)\)/);
+    if (pc) out.push(`Pax (${pc[1]})`);
+    const px = paxInLine(l);
+    for (const x of px) out.push(`${x.name} (${x.gw} - ${x.m}/${x.d}/${x.y})${x.primary ? " Primary" : ""}`);
+    if (!px.length && looksLikePax(l)) out.push("?? " + l.trim());
+  }
+  return out.join("\n");
 }
 
 function parsePasted(text) {
@@ -652,25 +704,11 @@ async function scanPhoto(file) {
 function busyMsg(msg) { const b = $("#busy"); b.textContent = msg || "Working…"; b.hidden = !msg; }
 // fix the usual OCR slips in "Jane Doe (Female - 3/7/81)" lines
 function cleanSheetText(text) {
-  return text.split(/\n/).map((l) => l
+  return text.split(/\n/).map((l) => fixGender(l)
     .replace(/[{\[]/g, "(").replace(/[}\]]/g, ")").replace(/[–—~=]/g, "-")
-    .replace(/\bF[eao][mn]?[mn]a[l1I|i]e\b/gi, "Female").replace(/\bMa[l1I|i]e\b/gi, "Male")
     .replace(/\((\s*(?:Male|Female|Unspecified|Undisclosed|X)\s*-\s*)([0-9OoIl|\/ ]{6,12})\)?/g, (m, g, d) =>
       `(${g}${d.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1").replace(/\s+/g, "")})`)
   ).join("\n");
-}
-// keep only what the parser needs, so the operator can proof-read it in the paste box
-function sheetLines(text) {
-  const out = [];
-  for (const l of cleanSheetText(text).split("\n")) {
-    if (/Crew Itinerary|\bLeg\s*\d/i.test(l)) { out.push(l.trim()); continue; }
-    PAX_RE.lastIndex = 0; let m;
-    while ((m = PAX_RE.exec(l))) {
-      const primary = /Primary/i.test(l.slice(m.index + m[0].length, m.index + m[0].length + 14)) ? " Primary" : "";
-      out.push(`${m[1].replace(/^Pax\s*\(\d+\)\s*/, "").trim()} (${m[2]} - ${m[3]}/${m[4]}/${m[5]})${primary}`);
-    }
-  }
-  return out.join("\n");
 }
 async function readTripSheetImages(images) {
   let text = "";
@@ -678,13 +716,21 @@ async function readTripSheetImages(images) {
     busyMsg(`Reading trip sheet ${images.length > 1 ? `page ${i + 1} of ${images.length}` : ""}… (can take ~10 s)`);
     text += (await ocrImage(enhance(await images[i](), 0.001))) + "\n";
   }
-  const lines = sheetLines(text);
-  const t = parseManifest(lines.split("\n"));
+  reviewSheet(cleanSheetText(text).split("\n"), "Read");
+}
+// put the extracted list in the paste box for proof-reading, saying what (if anything) is missing
+function reviewSheet(lines, verb) {
+  const pasteText = sheetToPaste(lines);
+  const t = parseManifest(pasteText.split("\n"));
   const n = t.legs.reduce((a, l) => a + l.pax.length, 0);
-  $("#paste").value = lines;
-  if (!n) return toast("Couldn't find passenger lines in that. Take the photo straight on, sheet filling the frame, good light — or type the list.");
+  const bad = (pasteText.match(/^\?\?/gm) || []).length;
+  $("#paste").value = pasteText;
+  if (!n && !bad) return toast("Couldn't find passenger lines in that. Take the photo straight on, sheet filling the frame, good light — or type the list.");
   $("#paste").scrollIntoView({ behavior: "smooth", block: "center" });
-  toast(`Read ${n} passenger${n > 1 ? "s" : ""}. Check names and birth dates against the sheet, fix any typos, then tap "Use pasted list".`);
+  const short = shortLegs(t);
+  toast(`${verb} ${n} passenger${n === 1 ? "" : "s"}${short.length ? ` (${short.join(", ")} on the sheet)` : ""}.` +
+    (bad ? ` ${bad} line${bad === 1 ? "" : "s"} marked ?? couldn't be read — fix them to look like "Jane Doe (Female - 3/7/81)" and remove the ??.` : "") +
+    ` Check names and birth dates against the sheet, then tap "Use pasted list".`);
 }
 async function loadSheetPhotos(files) {
   if (!files.length) return;
@@ -713,8 +759,11 @@ async function loadPdf(file) {
   busyMsg("Working…");
   try {
     const buf = new Uint8Array(await file.arrayBuffer());
-    const t = parseManifest(await pdfToLines(buf.slice()));
-    if (t.legs.length) { trip = t; legIdx = 0; render(); return; }
+    const lines = await pdfToLines(buf.slice());
+    const t = parseManifest(lines);
+    if (t.legs.length && !t.unparsed.length && !shortLegs(t).length) { trip = t; legIdx = 0; render(); return; }
+    // something missing: show the list to proof-read instead of silently loading a short one
+    if (t.legs.length || t.unparsed.length) return reviewSheet(lines, "Found");
     // no text layer (scanned / photographed PDF): read the page images
     await readTripSheetImages(await renderPdfPages(buf));
   } catch (e) { toast(e.message || e); }
@@ -727,7 +776,9 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#pasteGo").onclick = () => {
     const t = parsePasted($("#paste").value);
     if (!t.legs.length) return toast("No passengers found. Lines should look like: Jane Doe (Female - 3/7/81)");
+    const skipped = ($("#paste").value.match(/^\s*\?\?/gm) || []).length + t.unparsed.length, short = shortLegs(t);
     trip = t; legIdx = 0; render();
+    if (skipped || short.length) toast(`Loaded — but ${[skipped ? `${skipped} unreadable line${skipped === 1 ? " was" : "s were"} skipped` : "", short.length ? `${short.join(", ")} on the sheet` : ""].filter(Boolean).join("; ")}. Add missing people by scanning them (they go to "To add").`);
   };
   $("#search").oninput = render;
   $("#leg").onchange = (e) => { legIdx = +e.target.value; render(); };
@@ -746,4 +797,4 @@ window.addEventListener("DOMContentLoaded", () => {
 });
 
 // test hook (no effect in normal use)
-window.__idcheck = { pdfToLines, parseAAMVA, parseMRZ, readPassport, cleanSheetText, sheetLines, loadSheetPhotos, parseGeneric, parseManifest, match, handleScan, scanPhoto, loadPdf, get trip() { return trip; } };
+window.__idcheck = { pdfToLines, parseAAMVA, parseMRZ, readPassport, cleanSheetText, sheetToPaste, joinWrapped, loadSheetPhotos, parseGeneric, parseManifest, match, handleScan, scanPhoto, loadPdf, get trip() { return trip; } };

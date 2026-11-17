@@ -25,7 +25,8 @@
   .count { font-size:28px; font-weight:800; font-variant-numeric:tabular-nums; }
   .count.done { color:var(--g); }
   #cam { position:relative; margin:8px 0; }
-  #video { width:100%; border-radius:12px; background:#000; max-height:42vh; object-fit:cover; }
+  /* fixed landscape box: phones hand over a tall portrait feed when held upright or rotated — never let the box turn vertical */
+  #video { display:block; width:100%; aspect-ratio:16/10; height:auto; max-height:50vh; border-radius:12px; background:#000; object-fit:cover; }
   #cam .guide { position:absolute; left:6%; right:6%; top:28%; bottom:28%; border:3px solid rgba(255,255,255,.7); border-radius:10px; pointer-events:none; }
   #cam .hint { position:absolute; bottom:8px; left:0; right:0; text-align:center; font-size:13px; color:#fff; text-shadow:0 1px 3px #000; }
   #camErr { color:var(--y); }
