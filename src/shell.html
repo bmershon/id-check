@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' blob:; style-src 'unsafe-inline'; img-src data: blob:; media-src blob: mediastream:; worker-src blob:; connect-src data: blob:">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; style-src 'unsafe-inline'; img-src data: blob:; media-src blob: mediastream:; worker-src blob:; connect-src data: blob:">
 <title>Door ID Check</title>
 <style>
   :root { --bg:#0f1419; --card:#1a2129; --tx:#e8edf2; --mut:#8b98a5; --ac:#3d8bfd; --g:#1e9e57; --y:#d9a400; --r:#d93a3a; }
@@ -77,7 +77,7 @@
 <body>
 <section id="load">
   <h1>Door ID Check</h1>
-  <p class="mut">Load the JetInsight crew itinerary, then scan each passenger's ID barcode.</p>
+  <p class="mut">Load the JetInsight crew itinerary, then scan each passenger's ID, passport or badge.</p>
   <div class="card">
     <label class="filebtn">Open itinerary PDF<input id="pdf" type="file" accept="application/pdf"></label>
   </div>
@@ -97,14 +97,15 @@
     <select id="leg" hidden></select>
     <div class="row">
       <button id="scanBtn" class="grow">Start camera</button>
-      <label class="filebtn sec">Take photo of barcode<input id="photo" type="file" accept="image/*" capture="environment"></label>
+      <label class="filebtn sec">Take photo of ID<input id="photo" type="file" accept="image/*" capture="environment"></label>
     </div>
     <select id="camSel" hidden></select>
     <div id="camErr" hidden></div>
     <div id="cam" hidden>
       <video id="video" playsinline muted></video>
       <div class="guide"></div>
-      <div class="hint">Barcode on back of license, or badge barcode — fill the box</div>
+      <div class="hint">License back barcode, ID front, passport photo page or badge — fill the frame</div>
+      <div id="ocrState" hidden style="position:absolute;top:8px;left:8px;background:#000a;color:#fff;font-size:13px;padding:4px 8px;border-radius:8px"></div>
       <button id="torch" class="sec" hidden style="position:absolute;top:6px;right:6px;padding:8px 10px">Light</button>
     </div>
     <div class="chips">

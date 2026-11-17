@@ -4,11 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "mkdir -p build && base64 -i node_modules/zxing-wasm/dist/reader/zxing_reader.wasm | tr -d \"\\n\" > build/zxing_reader.wasm.b64 && node build.mjs"
+    "fetch-model": "mkdir -p build && [ -f build/eng.traineddata ] || curl -fsSL -o build/eng.traineddata https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata",
+    "build": "npm run fetch-model && mkdir -p build && base64 -i node_modules/zxing-wasm/dist/reader/zxing_reader.wasm | tr -d \"\\n\" > build/zxing_reader.wasm.b64 && base64 -i node_modules/tesseract-wasm/dist/tesseract-core.wasm | tr -d \"\\n\" > build/tesseract-core.wasm.b64 && base64 -i build/eng.traineddata | tr -d \"\\n\" > build/eng.traineddata.b64 && node build.mjs"
   },
   "dependencies": {
-    "zxing-wasm": "^3.1.7",
-    "pdfjs-dist": "^4.10.38"
+    "pdfjs-dist": "^4.10.38",
+    "tesseract-wasm": "^0.10.0",
+    "zxing-wasm": "^3.1.7"
   },
   "devDependencies": {
     "esbuild": "^0.28.2"

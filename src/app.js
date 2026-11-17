@@ -2,6 +2,7 @@ import { prepareZXingModule, readBarcodes } from "zxing-wasm/reader";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import * as pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.mjs";
 import WASM_B64 from "../build/zxing_reader.wasm.b64";
+import { initOCR, ocrImage, parseMRZ, ocrFields } from "./ocr.js";
 
 // ---------- setup ----------
 globalThis.pdfjsWorker = pdfWorker; // run pdf.js in main thread (no worker file needed)
@@ -133,10 +134,14 @@ function parsePasted(text) {
 function parseAAMVA(raw) {
   raw = raw.replace(/<LF>/g, "\n").replace(/<CR>/g, "\r").replace(/<RS>/g, "\x1e").replace(/<GS>/g, "\x1d");
   if (!/ANSI |AAMVA|\bDAQ|\bDCS|\bDAA/.test(raw)) return null;
-  // break subfile headers ("...DLDAQ..." / "...IDDCS...") onto new lines
-  let t = raw.replace(/(DL|ID)(?=D[A-Z]{2})/g, "\n");
   const f = {};
-  for (const line of t.split(/[\n\r\x1e\x1d]+/)) {
+  for (let line of raw.split(/[\n\r\x1e\x1d]+/)) {
+    // header line: "ANSI 636000090002DL00410278ZV03190008DLDAQ…" — drop the header and the
+    // subfile directory (2 letters + 8 digits each), keeping only the first data element.
+    // Only touch the header so names like MIDDLETON / SIDDIQUI are never split.
+    line = line.replace(/^.*?(?:ANSI|AAMVA)\s*\d+(?:[A-Z]{2}\d{8})*/, "");
+    // a subfile that starts its own line: "DLDAQ…", "IDDCS…"
+    line = line.replace(/^(?:DL|ID)(?=D[A-Z]{2})/, "");
     const m = line.match(/^(D[A-Z]{2}|Z[A-Z]{2})(.*)$/);
     if (m && !(m[1] in f)) f[m[1]] = m[2].trim();
   }
@@ -196,6 +201,23 @@ function parseGeneric(raw) {
   };
 }
 
+function ocrToId(text, barcodeId) {
+  const mrz = parseMRZ(text);
+  if (mrz) return { ...mrz, ocr: true };
+  const { fixed, gender } = ocrFields(text);
+  const id = { kind: "ID front / badge (text read)", first: "", middle: "", last: "", tokens: toks(fixed), dates: findDates(fixed), gender, raw: text, ocr: true };
+  if (barcodeId) {
+    id.kind = "Badge (barcode + printed name)";
+    id.tokens = [...barcodeId.tokens, ...id.tokens];
+    id.dates = [...barcodeId.dates, ...id.dates];
+    id.raw = barcodeId.raw + "\n---\n" + text;
+  }
+  return id;
+}
+// text reads are noisy: only accept one that clearly points at a passenger
+const ocrAcceptable = (res) => res.p && res.n.lastHit && (res.n.firstOk || res.n.firstPrefix || res.dobOk);
+const srcName = (id) => (id.key && id.key.startsWith("mrz:") ? "passport" : id.ocr ? "card text" : id.tokens ? "badge" : "ID");
+
 // ---------- matching ----------
 function nameScore(p, id) {
   const pf = toks(p.first), pl = toks(p.last), pm = toks(p.middle);
@@ -236,7 +258,7 @@ function match(id) {
   r.push(n.lastHit ? "✓ Last name" : n.lastPartial ? "~ Last name partial" : "✗ Last name");
   r.push(n.firstOk ? "✓ First name" : n.firstPrefix ? "~ First name similar (nickname/short?)" : "✗ First name");
   const hasDob = !!(id.dob || (id.dates && id.dates.length));
-  r.push(dobOk ? "✓ DOB" : hasDob ? `✗ DOB (ID ${fmtDate(id.dob || id.dates[0])} vs manifest ${fmtDate(p.dob)})` : "— DOB not in barcode");
+  r.push(dobOk ? "✓ DOB" : hasDob ? `✗ DOB (ID ${fmtDate(id.dob || id.dates[0])} vs manifest ${fmtDate(p.dob)})` : id.ocr ? "— DOB not read from card" : "— DOB not in barcode");
   if (id.gender) r.push(gOk ? "✓ Gender" : `✗ Gender (ID ${id.gender} vs manifest ${p.gender})`);
   if (id.expired) warn.push(`ID EXPIRED ${fmtDate(id.exp)}`);
   if (id.realId === "No") warn.push("Not REAL ID compliant");
@@ -246,7 +268,7 @@ function match(id) {
   else if (!gOk) level = "red";
   else level = "yellow";
   const title = level === "green" ? "MATCH" : level === "yellow" ? "CHECK BY EYE" : "MISMATCH";
-  return { level, title, p, reasons: r, warn };
+  return { level, title, p, reasons: r, warn, n, dobOk };
 }
 
 // ---------- UI ----------
@@ -277,7 +299,7 @@ function render() {
   const scanLi = (sc, lvl, sub) => {
     const li = document.createElement("li"); li.className = lvl;
     const who = sc.res.p ? sc.res.p.name : idLabel(sc.id);
-    const idn = sc.id.tokens ? "badge" : `ID: ${idLabel(sc.id)} · ${fmtDate(sc.id.dob)}${sc.id.gender ? " · " + sc.id.gender : ""}`;
+    const idn = sc.id.tokens ? srcName(sc.id) : `ID: ${idLabel(sc.id)} · ${fmtDate(sc.id.dob)}${sc.id.gender ? " · " + sc.id.gender : ""}`;
     li.innerHTML = `<div class="nm"><b>${esc(who)}</b></div><div class="meta">${esc(sub)}<br>${esc(idn)}</div><div class="st">${lvl === "red" ? "✗" : "?"}</div>`;
     li.onclick = () => detailSheet(sc); return li;
   };
@@ -300,6 +322,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 // ---------- scan log (continuous mode) ----------
 const LEVEL_ORDER = { red: 0, yellow: 1, green: 2 };
 function idKey(id) {
+  if (id.key) return id.key;
   return id.tokens ? "raw:" + id.raw : `${norm(id.last)}|${norm(id.first)}|${fmtDate(id.dob)}`;
 }
 function idLabel(id) {
@@ -332,16 +355,17 @@ function logScan(res, id) {
   leg.scans = leg.scans || [];
   const key = idKey(id);
   const prev = leg.scans.find((x) => x.key === key);
+  if (id.ocr && (prev || (res.p && res.p.status === "boarded"))) return; // same card still in view
   if (prev) { flash(prev.res.level, `Already scanned: ${prev.res.p ? prev.res.p.name : idLabel(id)}`); return; }
   // a second ID for someone already boarded (e.g. badge after license) — note it, don't double-count
   if (res.p && res.p.status === "boarded" && res.level === "green") {
-    res.p.how += id.tokens ? " + badge" : " + ID";
-    flash("green", `${res.p.name} — also matched ${id.tokens ? "badge" : "ID"}`);
+    res.p.how += " + " + srcName(id);
+    flash("green", `${res.p.name} — also matched ${srcName(id)}`);
     render(); return;
   }
   const entry = { key, id, res, t: new Date() };
   leg.scans.unshift(entry);
-  if (res.p && res.level === "green") { res.p.status = "boarded"; res.p.how = id.tokens ? "badge scan" : "ID scan"; }
+  if (res.p && res.level === "green") { res.p.status = "boarded"; res.p.how = srcName(id) + " scan"; }
   beep(res.level);
   flash(res.level, `${res.title}: ${res.p ? res.p.name : idLabel(id)}`);
   render();
@@ -379,7 +403,7 @@ function detailSheet(sc) {
       ${res.p && res.p.status === "boarded" && res.level !== "green" && !sc.resolved ? `<div class="w">⚠ ${esc(res.p.name)} is already boarded — this may be a different person or a duplicate.</div><button id="rOk" class="sec">Dismiss (resolved)</button>` : ""}
       ${res.p && res.p.status !== "boarded" ? `<button id="rBoard">Verified by eye — board</button>` : ""}
       ${res.p && res.p.status === "boarded" ? `<button id="rUndo" class="sec">Un-board</button>` : ""}
-      ${id.raw ? `<button id="rRaw" class="sec">Show barcode text</button>` : ""}
+      ${id.raw ? `<button id="rRaw" class="sec">${id.ocr ? "Show text read" : "Show barcode text"}</button>` : ""}
       <button id="rDel" class="sec">Remove scan</button>
       <button id="rNext">Close</button>
     </div>
@@ -394,13 +418,70 @@ function detailSheet(sc) {
   $("#rNext").onclick = () => { box.hidden = true; };
 }
 
-function handleScan(text) {
+function handleScan(text, img, fromPhoto) {
   if (!trip) return;
   const now = Date.now();
   if (text === lastScanText && now - lastScanAt < 3000) return;
-  lastScanText = text; lastScanAt = now;
   const id = parseAAMVA(text) || parseGeneric(text);
-  logScan(match(id), id);
+  const res = match(id);
+  if (id.tokens && !res.p && img && !id.retried) {
+    // e.g. employee badge whose barcode is just a number: read the printed name too
+    if (ocrBusy && !fromPhoto) return; // try again on the next frame
+    lastScanText = text; lastScanAt = now;
+    return runOCR(img, id, fromPhoto);
+  }
+  lastScanText = text; lastScanAt = now;
+  logScan(res, id);
+}
+
+// ---------- text reading (passport MRZ, ID fronts, badges) ----------
+let ocrBusy = false, lastOcrAt = 0, ocrQuietUntil = 0;
+function ocrState(msg) { const e = $("#ocrState"); if (e) { e.textContent = msg; e.hidden = !msg; } }
+async function runOCR(img, barcodeId, fromPhoto) {
+  ocrBusy = true; lastOcrAt = Date.now();
+  ocrState("Reading text…");
+  try {
+    const text = await ocrImage(img);
+    if (!trip) return false;
+    const id = ocrToId(text, barcodeId);
+    const res = match(id);
+    if (id.key || ocrAcceptable(res)) {
+      if (!id.key) id.key = barcodeId ? "raw:" + barcodeId.raw : "ocr:" + res.p.name;
+      ocrQuietUntil = Date.now() + 3000;
+      logScan(res, id);
+      return true;
+    }
+    if (barcodeId) { barcodeId.retried = true; logScan(match(barcodeId), barcodeId); return true; }
+    return false;
+  } catch (e) {
+    console.warn(e);
+    if (fromPhoto) toast(`Text reading failed: ${e.message || e}`);
+    if (barcodeId) { barcodeId.retried = true; logScan(match(barcodeId), barcodeId); return true; }
+    return false;
+  } finally {
+    ocrBusy = false; lastOcrAt = Date.now(); ocrState("");
+  }
+}
+const ocrCanvas = document.createElement("canvas");
+// the part of the video the user actually sees (object-fit: cover), scaled to ≤ maxW wide
+function visibleFrame(v, maxW = 1280) {
+  const r = v.getBoundingClientRect(), vw = v.videoWidth, vh = v.videoHeight;
+  const s = Math.max(r.width / vw, r.height / vh) || 1;
+  const sw = Math.min(vw, r.width / s), sh = Math.min(vh, r.height / s);
+  const k = Math.min(1, maxW / sw);
+  ocrCanvas.width = Math.round(sw * k); ocrCanvas.height = Math.round(sh * k);
+  const ctx = ocrCanvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(v, (vw - sw) / 2, (vh - sh) / 2, sw, sh, 0, 0, ocrCanvas.width, ocrCanvas.height);
+  return ctx.getImageData(0, 0, ocrCanvas.width, ocrCanvas.height);
+}
+async function fileToImageData(file, maxW = 2000) {
+  const bmp = await createImageBitmap(file);
+  const k = Math.min(1, maxW / Math.max(bmp.width, bmp.height));
+  ocrCanvas.width = Math.round(bmp.width * k); ocrCanvas.height = Math.round(bmp.height * k);
+  const ctx = ocrCanvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bmp, 0, 0, ocrCanvas.width, ocrCanvas.height);
+  bmp.close && bmp.close();
+  return ctx.getImageData(0, 0, ocrCanvas.width, ocrCanvas.height);
 }
 
 function manualSheet(p) {
@@ -447,10 +528,11 @@ async function startCam() {
       sel.hidden = cams.length < 2;
     } catch {}
     $("#scanBtn").textContent = "Stop camera";
+    initOCR().catch((e) => ocrState(`Text reading unavailable: ${e.message}`));
     resumeScan();
   } catch (e) {
     $("#camErr").hidden = false;
-    $("#camErr").textContent = `Live camera unavailable (${e.name || e}). Use "Take photo of barcode" instead.`;
+    $("#camErr").textContent = `Live camera unavailable (${e.name || e}). Use "Take photo of ID" instead.`;
   }
 }
 function stopCam() {
@@ -472,7 +554,9 @@ async function tick() {
       ctx.drawImage(v, 0, 0);
       const img = ctx.getImageData(0, 0, c.width, c.height);
       const res = await readBarcodes(img, { formats: FORMATS, tryHarder: true, maxNumberOfSymbols: 1, textMode: "Plain" });
-      if (res.length && res[0].text) handleScan(res[0].text);
+      const now = Date.now();
+      if (res.length && res[0].text) handleScan(res[0].text, visibleFrame(v));
+      else if (!ocrBusy && now - lastOcrAt > 1200 && now > ocrQuietUntil) runOCR(visibleFrame(v));
     } catch (e) { console.warn(e); }
     busy = false;
   }
@@ -489,8 +573,10 @@ async function scanPhoto(file) {
   $("#busy").hidden = false;
   try {
     const res = await readBarcodes(file, { formats: FORMATS, tryHarder: true, maxNumberOfSymbols: 1, textMode: "Plain" });
-    if (res.length && res[0].text) { lastScanText = ""; handleScan(res[0].text); }
-    else toast("No barcode found. Fill the frame with the barcode, hold steady, good light.");
+    const img = await fileToImageData(file);
+    if (res.length && res[0].text) { lastScanText = ""; await handleScan(res[0].text, img, true); return; }
+    if (!(await runOCR(img, null, true)))
+      toast("Couldn't read a trip-sheet name from that photo. Fill the frame with the ID or passport photo page, good light — or check by eye and tap the passenger to board.");
   } finally { $("#busy").hidden = true; }
 }
 
@@ -528,4 +614,4 @@ window.addEventListener("DOMContentLoaded", () => {
 });
 
 // test hook (no effect in normal use)
-window.__idcheck = { pdfToLines, parseAAMVA, parseGeneric, parseManifest, match, handleScan, scanPhoto, loadPdf, get trip() { return trip; } };
+window.__idcheck = { pdfToLines, parseAAMVA, ocrToId, parseMRZ, runOCR, parseGeneric, parseManifest, match, handleScan, scanPhoto, loadPdf, get trip() { return trip; } };
