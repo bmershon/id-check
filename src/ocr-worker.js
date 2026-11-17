@@ -19,6 +19,12 @@ self.onmessage = async (e) => {
       const text = engine.getText();
       engine.clearImage();
       self.postMessage({ id, ok: true, text });
+    } else if (type === "lines") {
+      engine.setVariable("tessedit_char_whitelist", e.data.whitelist || ALL_CHARS);
+      engine.loadImage(e.data.image);
+      const text = engine.getTextBoxes("line").map((b) => ({ text: b.text.trim(), rect: b.rect }));
+      engine.clearImage();
+      self.postMessage({ id, ok: true, text });
     }
   } catch (err) {
     self.postMessage({ id, ok: false, error: String((err && err.message) || err) });

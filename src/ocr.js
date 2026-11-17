@@ -37,6 +37,11 @@ export function initOCR() {
   return ready;
 }
 export const MRZ_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<";
+export async function ocrLines(img, { whitelist = "" } = {}) {
+  await initOCR();
+  const data = new Uint8ClampedArray(img.data);
+  return call({ type: "lines", whitelist, image: { width: img.width, height: img.height, data } }, [data.buffer]);
+}
 export async function ocrImage(img, { whitelist = "" } = {}) {
   await initOCR();
   const data = new Uint8ClampedArray(img.data); // copy so the caller's buffer stays usable
@@ -82,31 +87,38 @@ function result(kind, doc, dobS, sexC, expS, nameField, nameMax, country, raw) {
     key: `mrz:${dobS}|${expS}`, raw,
   };
 }
-// The birth and expiry dates each carry a check digit; both must pass. The document number's
-// check digit is not required (one misread letter there shouldn't block a good read).
+// Finds "DOB(6) cd SEX EXP(6) cd" anywhere in a line, so a dropped or extra character earlier in the
+// line (passport number area) doesn't shift it. Both date check digits must pass.
+function findDates(line) {
+  for (let k = 0; k + 15 <= line.length; k++) {
+    const dob = digits(line.slice(k, k + 6)), exp = digits(line.slice(k + 8, k + 14));
+    if (!/^\d{6}$/.test(dob) || !/^\d{6}$/.test(exp)) continue;
+    if (ok(dob, digits(line[k + 6])) && ok(exp, digits(line[k + 14]))) return { k, dob, exp, sex: line[k + 7] };
+  }
+  return null;
+}
+// a name line: mostly letters, with "<" fillers (which OCR may read as C/K) or the "P<" passport prefix
+const nameLike = (l) => l && (/</.test(l) || /^P/.test(l)) && (l.match(/[A-Z]/g) || []).length >= 4 && (l.match(/\d/g) || []).length <= 3;
 export function parseMRZ(text) {
   const L = mrzLines(text);
-  const hasFill = (...ls) => ls.some((l) => l && /<</.test(l));
   for (let j = 0; j < L.length; j++) {
+    const f = findDates(L[j]);
+    if (!f) continue;
     const b = L[j];
-    // TD3 (passport book), line 2: doc(9) cd nat(3) dob(6) cd sex exp(6) cd …
-    if (b.length >= 28) {
-      const dob = digits(b.slice(13, 19)), exp = digits(b.slice(21, 27));
-      if (ok(dob, digits(b[19])) && ok(exp, digits(b[27])) && hasFill(b, L[j - 1])) {
-        const a = L[j - 1] || "";
-        const r = result("Passport (MRZ)", b.slice(0, 9), dob, b[20], exp, a.length > 5 ? a.slice(5) : "", 39, letters(a.slice(2, 5)).replace(/</g, ""), `${a}
-${b}`);
-        if (r) return r;
-      }
-    }
-    // TD1 (US passport card, ID cards), line 2: dob(6) cd sex exp(6) cd nat(3) …; names on line 3
-    if (b.length >= 15) {
-      const dob = digits(b.slice(0, 6)), exp = digits(b.slice(8, 14));
-      if (ok(dob, digits(b[6])) && ok(exp, digits(b[14])) && hasFill(b, L[j - 1], L[j + 1])) {
-        const a = L[j - 1] || "", c = L[j + 1] || "";
-        const r = result(a[1] === "P" ? "Passport card (MRZ)" : "ID card (MRZ)", a.slice(5, 14), dob, b[7], exp, c, 30, letters(a.slice(2, 5)).replace(/</g, ""), `${a}\n${b}\n${c}`);
-        if (r) return r;
-      }
+    if (!/</.test(b) && !L.slice(Math.max(0, j - 2), j + 3).some((l) => /<</.test(l))) continue;
+    if (f.k >= 6) {
+      // TD3 passport book: name line is the line above (expected position 13 on line 2)
+      const a = [L[j - 1], L[j - 2]].find(nameLike) || "";
+      const nameField = a[0] === "P" && a.length > 5 ? a.slice(5) : a.replace(/^P.?[A-Z0-9]{3}/, "");
+      const r = result("Passport (MRZ)", b.slice(Math.max(0, f.k - 13), Math.max(0, f.k - 4)), f.dob, f.sex, f.exp, nameField, 39,
+        letters(b.slice(f.k - 3, f.k)).replace(/</g, ""), [a, b].filter(Boolean).join("\n"));
+      if (r) return r;
+    } else {
+      // TD1 (US passport card, ID cards): dates start line 2; names on line 3, document line above
+      const a = L[j - 1] || "", c = [L[j + 1], L[j + 2]].find(nameLike) || "";
+      const r = result(a[1] === "P" ? "Passport card (MRZ)" : "ID card (MRZ)", a.slice(5, 14), f.dob, f.sex, f.exp, c, 30,
+        letters(b.slice(f.k + 15, f.k + 18)).replace(/</g, ""), [a, b, c].filter(Boolean).join("\n"));
+      if (r) return r;
     }
   }
   return null;

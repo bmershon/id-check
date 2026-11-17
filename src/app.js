@@ -2,7 +2,7 @@ import { prepareZXingModule, readBarcodes } from "zxing-wasm/reader";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import * as pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.mjs";
 import WASM_B64 from "../build/zxing_reader.wasm.b64";
-import { initOCR, ocrImage, parseMRZ, mrzNameSimilarity, MRZ_CHARS } from "./ocr.js";
+import { initOCR, ocrImage, ocrLines, parseMRZ, mrzNameSimilarity, MRZ_CHARS } from "./ocr.js";
 
 // ---------- setup ----------
 globalThis.pdfjsWorker = pdfWorker; // run pdf.js in main thread (no worker file needed)
@@ -435,19 +435,44 @@ function enhance(img, clip = 0.02) {
   for (let i = 0; i < n; i++) { const v = Math.max(0, Math.min(255, (Y[i] - lo) * k)); d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v; }
   return img;
 }
+let lastPassportText = "";
+// crop a horizontal band and scale it up (MRZ text is often only ~20px tall in a camera frame)
+function cropBand(img, y0, y1, scale) {
+  const src = document.createElement("canvas"); src.width = img.width; src.height = img.height;
+  src.getContext("2d").putImageData(img, 0, 0);
+  const c = document.createElement("canvas"); c.width = Math.round(img.width * scale); c.height = Math.round((y1 - y0) * scale);
+  const ctx = c.getContext("2d", { willReadFrequently: true }); ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(src, 0, y0, img.width, y1 - y0, 0, 0, c.width, c.height);
+  return ctx.getImageData(0, 0, c.width, c.height);
+}
 async function readPassport(img, fromPhoto) {
   ocrBusy = true; lastOcrAt = Date.now();
+  if (fromPhoto) lastPassportText = "";
   try {
-    const text = await ocrImage(enhance(img), { whitelist: MRZ_CHARS });
+    enhance(img);
+    let lines = await ocrLines(img, { whitelist: MRZ_CHARS });
+    let text = lines.map((l) => l.text).join("\n");
+    let mrz = parseMRZ(text);
+    const zone = lines.filter((l) => /<<|<{3}/.test(l.text.replace(/\s/g, "")));
+    if (!mrz && zone.length) {
+      // second pass: zoom into the <<< band, including a line above/below that may have been missed
+      const lh = Math.max(...zone.map((l) => l.rect.bottom - l.rect.top));
+      const y0 = Math.max(0, Math.min(...zone.map((l) => l.rect.top)) - 1.6 * lh);
+      const y1 = Math.min(img.height, Math.max(...zone.map((l) => l.rect.bottom)) + 1.6 * lh);
+      const scale = Math.max(1, Math.min(2.5, 2600 / img.width, 70 / Math.max(8, lh)));
+      lines = await ocrLines(cropBand(img, Math.round(y0), Math.round(y1), scale), { whitelist: MRZ_CHARS });
+      text = lines.map((l) => l.text).join("\n");
+      mrz = parseMRZ(text);
+    }
     if (!trip) return false;
-    const mrz = parseMRZ(text);
+    if (zone.length) lastPassportText = text;
     if (mrz) {
       const id = { ...mrz, mrz: true };
       ocrQuietUntil = Date.now() + 3000; ocrState("");
       logScan(match(id), id);
       return true;
     }
-    if (!fromPhoto) ocrState(/<{4,}/.test(text) ? "Passport code seen — hold steady, no glare" : "");
+    if (!fromPhoto) ocrState(zone.length ? "Passport code seen — hold steady, no glare (tap to see text)" : "");
     return false;
   } catch (e) {
     console.warn(e);
@@ -570,7 +595,7 @@ async function scanPhoto(file) {
     const res = await readBarcodes(file, { formats: FORMATS, tryHarder: true, maxNumberOfSymbols: 1, textMode: "Plain" });
     if (res.length && res[0].text) { lastScanText = ""; handleScan(res[0].text); return; }
     if (!(await readPassport(await fileToImageData(file), true)))
-      toast("No license barcode or passport code found. Photograph the barcode on the back of the license, or the passport photo page with the <<< lines — or check by eye and tap the passenger to board.");
+      toast((lastPassportText ? `Passport code not readable (read: ${lastPassportText}). ` : "") + "No license barcode or passport code found. Photograph the barcode on the back of the license, or the passport photo page with the <<< lines — or check by eye and tap the passenger to board.");
   } finally { $("#busy").hidden = true; }
 }
 
@@ -648,6 +673,7 @@ async function loadPdf(file) {
 }
 window.addEventListener("DOMContentLoaded", () => {
   $("#pdf").onchange = (e) => loadPdf(e.target.files[0]);
+  $("#ocrState").onclick = () => { if (lastPassportText) toast("Read: " + lastPassportText); };
   $("#sheetPhoto").onchange = (e) => { loadSheetPhotos(e.target.files); e.target.value = ""; };
   $("#pasteGo").onclick = () => {
     const t = parsePasted($("#paste").value);

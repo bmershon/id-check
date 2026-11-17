@@ -48,7 +48,7 @@
   .result pre { white-space:pre-wrap; word-break:break-all; font-size:12px; background:#0008; padding:8px; border-radius:8px; }
   #busy { position:fixed; inset:0; background:#000a; display:flex; align-items:center; justify-content:center; font-size:20px; z-index:30; }
   #pending { font-size:14px; color:var(--mut); }
-  #toast { position:fixed; left:12px; right:12px; top:12px; background:#2c3640; padding:12px; border-radius:10px; z-index:40; font-weight:600; }
+  #toast { position:fixed; left:12px; right:12px; top:12px; background:#2c3640; padding:12px; border-radius:10px; z-index:40; font-weight:600; white-space:pre-wrap; word-break:break-all; }
   .chips { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin:6px 0; }
   .chip { text-decoration:none; color:var(--tx); background:var(--card); border-radius:10px; padding:6px 4px; text-align:center; font-size:12px; border-top:4px solid; }
   .chip b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
@@ -106,7 +106,7 @@
       <video id="video" playsinline muted></video>
       <div class="guide"></div>
       <div class="hint">Barcode on back of license / REAL ID, or passport photo page (the &lt;&lt;&lt; lines) — fill the frame</div>
-      <div id="ocrState" hidden style="position:absolute;top:8px;left:8px;background:#000a;color:#fff;font-size:13px;padding:4px 8px;border-radius:8px"></div>
+      <div id="ocrState" hidden style="cursor:pointer;position:absolute;top:8px;left:8px;background:#000a;color:#fff;font-size:13px;padding:4px 8px;border-radius:8px"></div>
       <button id="torch" class="sec" hidden style="position:absolute;top:6px;right:6px;padding:8px 10px">Light</button>
     </div>
     <div class="chips">
