@@ -1,6 +1,6 @@
 // On-device text reading (Tesseract):
 //  - passports / passport cards: the machine-readable zone (MRZ), validated by check digits
-//  - trip sheets: photos or scanned PDFs without a text layer
+//  - trip sheets: photos of a list of names
 import WORKER_SRC from "../build/ocr-worker.js.txt";
 import WASM_B64 from "../build/tesseract-core.wasm.b64";
 import MODEL_B64 from "../build/eng.traineddata.b64";
@@ -42,10 +42,10 @@ export async function ocrLines(img, { whitelist = "" } = {}) {
   const data = new Uint8ClampedArray(img.data);
   return call({ type: "lines", whitelist, image: { width: img.width, height: img.height, data } }, [data.buffer]);
 }
-export async function ocrImage(img, { whitelist = "" } = {}) {
+export async function ocrImage(img, { whitelist = "", psm = 3, columns = false } = {}) {
   await initOCR();
   const data = new Uint8ClampedArray(img.data); // copy so the caller's buffer stays usable
-  return call({ type: "ocr", whitelist, image: { width: img.width, height: img.height, data } }, [data.buffer]);
+  return call({ type: "ocr", whitelist, psm, columns, image: { width: img.width, height: img.height, data } }, [data.buffer]);
 }
 
 // ---------- MRZ (passport TD3 2x44, passport card / ID card TD1 3x30) ----------
@@ -68,6 +68,7 @@ const trimFill = (s) => letters(s).replace(/[<CK]{3,}$/, "").replace(/<+$/, "");
 function mrzName(s) {
   const [last, rest = ""] = trimFill(s).split(/<<+/);
   const given = rest.split("<").filter(Boolean);
+  while (given.length > 1 && given[given.length - 1].length === 1) given.pop(); // "GEORGE<X": filler noise
   return { last: last.replace(/</g, " ").trim(), first: given[0] || "", middle: given.slice(1).join(" ") };
 }
 const mrzDate = (s, future) => {

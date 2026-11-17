@@ -1,11 +1,8 @@
 import { prepareZXingModule, readBarcodes } from "zxing-wasm/reader";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-import * as pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.mjs";
 import WASM_B64 from "../build/zxing_reader.wasm.b64";
 import { initOCR, ocrImage, ocrLines, parseMRZ, mrzNameSimilarity, MRZ_CHARS } from "./ocr.js";
 
 // ---------- setup ----------
-globalThis.pdfjsWorker = pdfWorker; // run pdf.js in main thread (no worker file needed)
 function b64ToBytes(b64) {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
@@ -14,7 +11,9 @@ function b64ToBytes(b64) {
 }
 prepareZXingModule({ overrides: { wasmBinary: b64ToBytes(WASM_B64).buffer } });
 
-const FORMATS = ["PDF417", "QRCode", "DataMatrix", "Aztec", "Code128", "Code39"];
+// only the PDF417 block on the back of a license / REAL ID. Licenses also carry a thin 1D barcode with no
+// name in it; reading that first is what made scans come back without the name.
+const FORMATS = ["PDF417"];
 const $ = (s) => document.querySelector(s);
 
 // ---------- state (memory only; nothing persisted) ----------
@@ -55,25 +54,6 @@ const G = (g) => {
 };
 
 // ---------- manifest parsing ----------
-async function pdfToLines(buf) {
-  const doc = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false }).promise;
-  const lines = [];
-  for (let p = 1; p <= doc.numPages; p++) {
-    const page = await doc.getPage(p);
-    const tc = await page.getTextContent();
-    // group items into rows: items whose baselines are within ~5pt share a row
-    const items = tc.items.filter((it) => it.str && it.str.trim()).map((it) => ({ x: it.transform[4], y: it.transform[5], s: it.str.trim() }));
-    items.sort((a, b) => b.y - a.y);
-    const rows = [];
-    for (const it of items) {
-      const r = rows.find((r) => Math.abs(r.y - it.y) < 5);
-      if (r) r.c.push(it); else rows.push({ y: it.y, c: [it] });
-    }
-    rows.sort((a, b) => b.y - a.y).forEach((r) => lines.push(r.c.sort((a, b) => a.x - b.x).map((c) => c.s).join("   ")));
-  }
-  return lines;
-}
-
 const PAX_RE =
   /([A-Za-zÀ-ɏ][A-Za-zÀ-ɏ'.\- ]+?)\s*\(\s*(Male|Female|Unspecified|Undisclosed|X)\s*[-–—]\s*(\d{1,2})\/(\d{1,2})\/(\d{2,4})\s*\)/g;
 
@@ -83,14 +63,23 @@ const LOOSE_RE =
 const GENDER_START = /^\s*[(\[{]?\s*(Male|Female|Unspecified|Undisclosed|X)\b/i;
 // common OCR misreads of the gender word: Fernale, Femaie, Fema1e, Maie, Mo1e …
 const fixGender = (s) => s.replace(/\bF[eao][mnr]{0,2}[mn]?a[l1I|it]e\b/gi, "Female").replace(/\bM[ao][l1I|i]e\b/gi, "Male");
+// checkbox / bullet misreads in front of a name: "O", "C)", "()", "OC)", "_ OU", "CQ" …
+const isJunk = (t) => !/[A-Za-zÀ-ɏ]/.test(t) || /^[A-Z]{1,2}[)\]}]?$/.test(t) || /^[(\[{|][A-Za-z]{0,2}[)\]}]?$/.test(t) || /^[a-z][)\]}]$/.test(t);
+// OCR reads a capital I at the start of a name as l or | ("lvanova", "|sabella")
+const fixName = (name) => name.replace(/(^|[\s'-])[l|](?=[a-zà-ÿ]{2})/g, "$1I");
+function stripJunk(name) {
+  const t = name.split(" ");
+  while (t.length > 2 && isJunk(t[0])) t.shift(); // always keep at least first + last name
+  return t.join(" ");
+}
 // passenger entries in one line: strict pattern first, loose fallback only if nothing matched
 function paxInLine(s) {
   const out = [];
   for (const [re, line] of [[PAX_RE, s], [LOOSE_RE, fixGender(s)]]) {
     re.lastIndex = 0; let m;
     while ((m = re.exec(line))) {
-      const name = m[1].replace(/^.*\bPax\s*\(\d+\)\s*/i, "").replace(/\s+/g, " ").trim()
-        .replace(/\s+[Cc(|]$/, ""); // "Noah Davis CMale": a misread "(" stuck to the gender word
+      const name = fixName(stripJunk(m[1].replace(/^.*\bPax\s*\(\d+\)\s*/i, "").replace(/\s+/g, " ").trim()
+        .replace(/\s+[Cc(|]$/, ""))); // "Noah Davis CMale": a misread "(" stuck to the gender word
       const after = line.slice(m.index + m[0].length, m.index + m[0].length + 14);
       if (name.replace(/[^A-Za-zÀ-ɏ]/g, "").length >= 2)
         out.push({ name, g: G(m[2]), gw: m[2][0].toUpperCase() + m[2].slice(1).toLowerCase(), m: +m[3], d: +m[4], y: yy2yyyy(m[5]), primary: /Primary/i.test(after) });
@@ -116,65 +105,71 @@ const looksLikePax = (l) =>
   /\d{1,2}\s*[\/.\-]\s*\d{1,2}\s*[\/.\-]\s*\d{2,4}/.test(l) && /[(\[{|C]\s*[MFX][a-z0-9|]{0,7}\s*[-–—~=:]|male|female/i.test(l) &&
   !/\bLeg\b|\bDep\b|\bArr\b|\bET[AD]\b|\b\d{1,2}:\d{2}\b|Itinerary|Printed|Page \d/i.test(l) && !paxInLine(l).length;
 
+// a plain name line ("Jane Doe", "DOE, JANE", "1. Jane Ann Doe", "☐ Jane Doe (Primary)") — used only when the
+// list has no "Name (Gender - date)" entries at all
+const NOT_NAMES = /\b(pax|passengers?|names?|list|manifest|crew|itinerary|total|page|leg|fees?|fuel|landing|parking|handling|infrastructure|aviation|airport|fbo|catering|release|status|date|time|dep|arr|notes?|phone|email|tail|aircraft|pilot|captain|signature|checks?|tsa|complete[d]?|united|states|america)\b/i;
+function nameOnly(line) {
+  let s = line.replace(/\(?\bPrimary\b\)?/i, "").replace(/^\s*(?:\d{1,3}\s*[.)\-:]|[-•*·])\s*/, "").replace(/\s+/g, " ").trim();
+  s = fixName(stripJunk(s));
+  if (!s || /[0-9@$#%/:=+&|_<>]/.test(s) || NOT_NAMES.test(s)) return null;
+  const c = s.match(/^([A-Za-zÀ-ɏ'’.\-]+(?: [A-Za-zÀ-ɏ'’.\-]+)?),\s*([A-Za-zÀ-ɏ'’.\- ]+)$/); // "Doe, Jane"
+  if (c) s = `${c[2]} ${c[1]}`;
+  const t = s.split(" ");
+  if (t.length < 2 || t.length > 5 || !t.every((w) => /^[A-ZÀ-Þ][A-Za-zÀ-ɏ'’.\-]*$/.test(w))) return null;
+  if (t.filter((w) => w.replace(/[^A-Za-zÀ-ɏ]/g, "").length >= 2).length < 2) return null;
+  return { name: s === s.toUpperCase() ? titleCase(s) : s, primary: /Primary/i.test(line) };
+}
+function newPax(x) {
+  const t = x.name.split(/\s+/);
+  return {
+    name: x.name, first: t[0], last: t[t.length - 1], middle: t.slice(1, -1).join(" "),
+    gender: x.g || "", dob: x.m ? { m: x.m, d: x.d, y: x.y } : null, primary: !!x.primary,
+    status: "pending", // pending | boarded | flagged
+    how: "", note: "",
+  };
+}
+// Any list of names is a trip sheet. Legs are ignored: everyone goes into one list, and a person listed on
+// several legs appears once.
 function parseManifest(lines) {
   lines = joinWrapped(lines.filter((l) => !/^\s*\?\?/.test(l)));
   const text = lines.join("\n");
   const idm = text.match(/Crew Itinerary\s*\(([A-Z0-9]+)\)/) || text.match(/\(([A-Z0-9]{5,8})\)/);
-  const legs = [];
-  let cur = null;
-  const ensureLeg = (n, route) => {
-    let l = legs.find((x) => x.n === n);
-    if (!l) {
-      l = { n, route: route || "", expected: null, pax: [] };
-      legs.push(l);
-    }
-    if (route && !l.route) l.route = route;
-    return l;
-  };
-  for (let i = 0; i < lines.length; i++) {
-    const s = lines[i];
-    let m = s.match(/\bLeg\s+(\d+)\s*:\s*([A-Z0-9]{3,4})[^A-Za-z0-9]+([A-Z0-9]{3,4})\b/);
-    if (m) { cur = ensureLeg(+m[1], `${m[2]} → ${m[3]}`); continue; }
-    m = s.match(/\bLeg\s+(\d+)\s*:\s*Pax:\s*(\d+)/);
-    if (m) { const l = ensureLeg(+m[1]); l.expected = +m[2]; }
-    m = s.match(/\bPax\s*\((\d+)\)/);
-    if (m && cur && cur.expected == null) cur.expected = +m[1];
-    for (const x of paxInLine(s)) {
-      if (!cur) cur = ensureLeg(1);
-      const t = x.name.split(/\s+/);
-      cur.pax.push({
-        name: x.name,
-        first: t[0],
-        last: t[t.length - 1],
-        middle: t.slice(1, -1).join(" "),
-        gender: x.g,
-        dob: { m: x.m, d: x.d, y: x.y },
-        primary: x.primary,
-        status: "pending", // pending | boarded | flagged
-        how: "",
-        note: "",
-      });
-    }
+  let found = [];
+  const counts = [];
+  for (const s of lines) {
+    const c = s.match(/\bPax\s*\((\d+)\)/) || s.match(/\bPax:\s*(\d+)/);
+    if (c) counts.push(+c[1]);
+    found.push(...paxInLine(s));
   }
-  legs.forEach((l) => {
-    l.pax.sort((a, b) => norm(a.last).localeCompare(norm(b.last)) || norm(a.first).localeCompare(norm(b.first)));
-    if (l.expected == null) l.expected = l.pax.length;
-  });
-  return { id: idm ? idm[1] : "", legs: legs.filter((l) => l.pax.length), unparsed: lines.filter(looksLikePax).map((l) => l.trim()) };
+  if (!found.length) found = lines.map(nameOnly).filter(Boolean);
+  const seen = new Map();
+  for (const x of found) {
+    const k = norm(x.name) + "|" + (x.m ? `${x.m}/${x.d}/${x.y}` : "");
+    if (seen.has(k)) seen.get(k).primary ||= !!x.primary; else seen.set(k, newPax(x));
+  }
+  const pax = [...seen.values()].sort((a, b) => norm(a.last).localeCompare(norm(b.last)) || norm(a.first).localeCompare(norm(b.first)));
+  // the sheet's own "Pax (N)" count, when there is one consistent count
+  const expected = counts.length && new Set(counts).size === 1 ? Math.max(counts[0], pax.length) : pax.length;
+  return { id: idm ? idm[1] : "", legs: pax.length ? [{ n: 1, route: "", expected, pax }] : [], unparsed: lines.filter(looksLikePax).map((l) => l.trim()) };
 }
-// "Leg 1: 23 of 28" for legs where the sheet's own count is higher than what was read
-const shortLegs = (t) => t.legs.filter((l) => l.expected > l.pax.length).map((l) => `Leg ${l.n}: ${l.pax.length} of ${l.expected}`);
+// "23 of 28" when the sheet's own count is higher than what was read
+const shortLegs = (t) => t.legs.filter((l) => l.expected > l.pax.length).map((l) => `${l.pax.length} of ${l.expected}`);
 // canonical, proof-readable passenger list for the paste box; unreadable passenger-like lines marked "??"
 function sheetToPaste(lines) {
   const out = [];
-  for (const l of joinWrapped(lines)) {
-    if (/Crew Itinerary|\bLeg\s*\d/i.test(l)) { out.push(l.trim()); continue; }
+  let structured = 0;
+  lines = joinWrapped(lines);
+  for (const l of lines) {
+    if (/^\s*\?\?/.test(l)) { out.push(l.trim()); continue; } // already flagged for review
+    if (/Crew Itinerary/i.test(l)) { out.push(l.trim()); continue; }
     const pc = l.match(/\bPax\s*\((\d+)\)/);
-    if (pc) out.push(`Pax (${pc[1]})`);
+    if (pc && !out.includes(`Pax (${pc[1]})`)) out.push(`Pax (${pc[1]})`);
     const px = paxInLine(l);
+    structured += px.length;
     for (const x of px) out.push(`${x.name} (${x.gw} - ${x.m}/${x.d}/${x.y})${x.primary ? " Primary" : ""}`);
     if (!px.length && looksLikePax(l)) out.push("?? " + l.trim());
   }
+  if (!structured) for (const l of lines) { const x = nameOnly(l); if (x && !out.includes(x.name)) out.push(x.name + (x.primary ? " Primary" : "")); }
   return out.join("\n");
 }
 
@@ -266,7 +261,8 @@ function nameScore(p, id) {
     idAll = new Set([...idFirst, ...idLast]);
   }
   const lastHit = pl.length && pl.every((t) => idLast.has(t) || [...idLast].some((x) => x.replace(/ /g, "") === t));
-  const lastPartial = !lastHit && pl.some((t) => idAll.has(t));
+  // "Anmed" on a photographed sheet vs AHMED on the ID: close spelling counts as a partial match
+  const lastPartial = !lastHit && (pl.some((t) => idAll.has(t)) || (pl.length && [...idLast].some((x) => similarity(x, pl.join("")) >= 0.75)));
   const firstExact = pf.length && pf.every((t) => idFirst.has(t));
   const firstPrefix = !firstExact && pf.some((t) => [...idFirst].some((x) => t.length >= 3 && x.length >= 3 && (x.startsWith(t) || t.startsWith(x))));
   // hyphenated/compound first names: "Pierre-etienne" vs ID "PIERRE ETIENNE"
@@ -290,7 +286,7 @@ function match(id) {
       else if (sim >= 0.5 && !n.lastHit) n = { ...n, s: Math.max(n.s, 20), lastPartial: true };
     }
     const dobs = id.dob ? [id.dob] : id.dates || [];
-    const dobOk = dobs.some((d) => sameDate(d, p.dob));
+    const dobOk = !!p.dob && dobs.some((d) => sameDate(d, p.dob));
     const gOk = !id.gender || !p.gender || id.gender === p.gender;
     const score = n.s + (dobOk ? 40 : 0) + (id.gender && gOk ? 5 : 0);
     if (!best || score > best.score) best = { p, n, dobOk, gOk, score };
@@ -307,11 +303,11 @@ function match(id) {
   r.push(n.lastHit ? "✓ Last name" : n.lastPartial ? "~ Last name partial" : "✗ Last name");
   r.push(n.firstOk ? "✓ First name" : n.firstPrefix ? "~ First name similar (nickname/short?)" : "✗ First name");
   const hasDob = !!(id.dob || (id.dates && id.dates.length));
-  r.push(dobOk ? "✓ DOB" : hasDob ? `✗ DOB (ID ${fmtDate(id.dob || id.dates[0])} vs manifest ${fmtDate(p.dob)})` : "— DOB not in barcode");
+  r.push(dobOk ? "✓ DOB" : !p.dob ? "— DOB not on trip sheet" : hasDob ? `✗ DOB (ID ${fmtDate(id.dob || id.dates[0])} vs manifest ${fmtDate(p.dob)})` : "— DOB not in barcode");
   if (id.gender) r.push(gOk ? "✓ Gender" : `✗ Gender (ID ${id.gender} vs manifest ${p.gender})`);
   let level;
-  if (n.lastHit && n.firstOk && dobOk && gOk && !warn.length) level = "green";
-  else if (hasDob && !dobOk && n.lastHit) level = "red";
+  if (n.lastHit && n.firstOk && (dobOk || !p.dob) && gOk && !warn.length) level = "green";
+  else if (hasDob && p.dob && !dobOk && n.lastHit) level = "red";
   else if (!gOk) level = "red";
   else level = "yellow";
   const title = level === "green" ? "MATCH" : level === "yellow" ? "CHECK BY EYE" : "MISMATCH";
@@ -325,7 +321,7 @@ function render() {
   $("#load").hidden = true; app.hidden = false;
   const leg = trip.legs[legIdx];
   const boarded = leg.pax.filter((p) => p.status === "boarded").length;
-  $("#tripTitle").textContent = `${trip.id || "Trip"} · Leg ${leg.n} ${leg.route}`;
+  $("#tripTitle").textContent = trip.id ? `Trip ${trip.id}` : "Trip sheet";
   const toAddN = (leg.scans || []).filter(isToAdd).length;
   $("#count").textContent = `${boarded} / ${leg.expected}${toAddN ? ` +${toAddN}` : ""}`;
   $("#count").className = boarded === leg.expected ? "count done" : "count";
@@ -355,7 +351,7 @@ function render() {
   const paxLi = (p, lvl) => {
     const li = document.createElement("li"); li.className = lvl;
     li.innerHTML = `<div class="nm"><b>${esc(p.last)}</b>, ${esc([p.first, p.middle].filter(Boolean).join(" "))}${p.primary ? ' <span class="tag">Primary</span>' : ""}</div>
-      <div class="meta">${p.gender || "?"} · ${fmtDate(p.dob)}${p.how ? ` · ${esc(p.how)}` : ""}</div>
+      <div class="meta">${p.dob || p.gender ? `${p.gender || "?"} · ${fmtDate(p.dob)}` : "name only"}${p.how ? ` · ${esc(p.how)}` : ""}</div>
       <div class="st">${lvl === "green" ? "✓" : p.status === "flagged" ? "!" : ""}</div>`;
     li.onclick = () => manualSheet(p); return li;
   };
@@ -442,7 +438,7 @@ const genderWord = (g) => (g === "M" ? "Male" : g === "F" ? "Female" : "Unspecif
 async function copyAddList(leg, list) {
   // same "Name (Gender - m/d/yyyy)" format as the trip sheet, ready to send to dispatch
   const lines = list.map((sc) => `${titleCase(idLabel(sc.id))} (${genderWord(sc.id.gender)} - ${fmtDate(sc.id.dob)})`);
-  const text = `Add to ${trip.id || "trip"} · Leg ${leg.n} ${leg.route}:\n` + lines.join("\n");
+  const text = `Add to ${trip.id ? "trip " + trip.id : "the trip"}:\n` + lines.join("\n");
   try { await navigator.clipboard.writeText(text); }
   catch {
     const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta); ta.select();
@@ -500,13 +496,15 @@ function handleScan(text) {
   const now = Date.now();
   if (text === lastScanText && now - lastScanAt < 3000) return;
   lastScanText = text; lastScanAt = now;
-  const id = parseAAMVA(text) || parseGeneric(text);
+  const id = parseAAMVA(text);
+  if (!id) { ocrState("Not a license barcode — use the big barcode on the back"); return false; } // e.g. a boarding pass
   logScan(match(id), id);
+  return true;
 }
 
 // ---------- text reading ----------
 // Camera: only the passport / passport-card machine-readable zone (the <<< lines), which is
-// validated by check digits. Trip sheets: photos and scanned PDFs (see readTripSheetImages).
+// validated by check digits. Trip sheets: photos of a list of names (see readTripSheetImages).
 let ocrBusy = false, lastOcrAt = 0, ocrQuietUntil = 0;
 function ocrState(msg) { const e = $("#ocrState"); if (e) { e.textContent = msg; e.hidden = !msg; } }
 // grayscale + contrast stretch: helps with glare, tinted security backgrounds and dim light
@@ -539,7 +537,9 @@ async function readPassport(img, fromPhoto) {
     let lines = await ocrLines(img, { whitelist: MRZ_CHARS });
     let text = lines.map((l) => l.text).join("\n");
     let mrz = parseMRZ(text);
-    const zone = lines.filter((l) => /<<|<{3}/.test(l.text.replace(/\s/g, "")));
+   
+    // MRZ-looking lines: filler "<", or a long letters+digits run like "A629010071USA9401080M3505"
+    const zone = lines.filter((l) => { const t = l.text.replace(/\s/g, ""); return /</.test(t) || (/^[A-Z0-9]{18,}$/.test(t) && (t.match(/\d/g) || []).length >= 8); });
     if (!mrz && zone.length) {
       // second pass: zoom into the <<< band, including a line above/below that may have been missed
       const lh = Math.max(...zone.map((l) => l.rect.bottom - l.rect.top));
@@ -693,8 +693,11 @@ async function scanPhoto(file) {
   if (!file) return;
   $("#busy").hidden = false;
   try {
-    const res = await readBarcodes(file, { formats: FORMATS, tryHarder: true, maxNumberOfSymbols: 1, textMode: "Plain" });
-    if (res.length && res[0].text) { lastScanText = ""; handleScan(res[0].text); return; }
+    const opts = { formats: FORMATS, tryHarder: true, maxNumberOfSymbols: 1, textMode: "Plain" };
+    let res = await readBarcodes(file, opts);
+    // a 12-megapixel photo can defeat the PDF417 finder: retry on smaller copies
+    for (const w of [2000, 1400]) if (!(res.length && res[0].text)) res = await readBarcodes(await fileToImageData(file, w), opts);
+    if (res.length && res[0].text) { lastScanText = ""; if (handleScan(res[0].text)) return; }
     if (!(await readPassport(await fileToImageData(file), true)))
       toast((lastPassportText ? `Passport code not readable (read: ${lastPassportText}). ` : "") + "No license barcode or passport code found. Photograph the barcode on the back of the license, or the passport photo page with the <<< lines — or check by eye and tap the passenger to board.");
   } finally { $("#busy").hidden = true; }
@@ -710,13 +713,100 @@ function cleanSheetText(text) {
       `(${g}${d.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1").replace(/\s+/g, "")})`)
   ).join("\n");
 }
-async function readTripSheetImages(images) {
-  let text = "";
-  for (let i = 0; i < images.length; i++) {
-    busyMsg(`Reading trip sheet ${images.length > 1 ? `page ${i + 1} of ${images.length}` : ""}… (can take ~10 s)`);
-    text += (await ocrImage(enhance(await images[i](), 0.001))) + "\n";
+let lastSheetText = ""; // raw OCR text of the last trip-sheet photo (memory only; test hook)
+// OCR the image whole and in overlapping horizontal strips: Tesseract sometimes skips lines of a
+// photographed page (perspective, moiré), and a different crop usually recovers them.
+async function ocrPasses(img, onPass) {
+  const src = document.createElement("canvas"); src.width = img.width; src.height = img.height;
+  src.getContext("2d").putImageData(img, 0, 0);
+  const passes = [];
+  for (const [n, overlap] of [[1, 0], [3, 0.15], [4, 0.2]]) {
+    let text = "";
+    const h = img.height / n;
+    for (let i = 0; i < n; i++) {
+      const y0 = Math.max(0, Math.round(i * h - overlap * h)), y1 = Math.min(img.height, Math.round((i + 1) * h + overlap * h));
+      const c = document.createElement("canvas"); c.width = img.width; c.height = y1 - y0;
+      const x = c.getContext("2d", { willReadFrequently: true });
+      x.drawImage(src, 0, y0, img.width, y1 - y0, 0, 0, img.width, y1 - y0);
+      text += (await ocrImage(x.getImageData(0, 0, c.width, c.height), { columns: true })) + "\n";
+    }
+    passes.push(text);
+    onPass && onPass(passes.length);
   }
-  reviewSheet(cleanSheetText(text).split("\n"), "Read");
+  return passes;
+}
+const letterKey = (s) => norm(s).replace(/ /g, "");
+function similarity(a, b) {
+  if (!a || !b) return 0;
+  const d = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = d[0]; d[0] = i;
+    for (let j = 1; j <= b.length; j++) { const t = d[j]; d[j] = Math.min(d[j] + 1, d[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = t; }
+  }
+  return 1 - d[b.length] / Math.max(a.length, b.length);
+}
+// Combine the passes: one entry per person (names read slightly differently count as the same person),
+// majority vote on name spelling and date of birth; a DOB the passes disagree on is marked "??".
+function mergePasses(passes) {
+  const people = [], plain = [], heads = [], unread = [];
+  const best = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]);
+  const vote = (o, k, pi) => (o[k] = (o[k] || 0) + 1 + (pi === 0 ? 0.1 : 0)); // ties go to the whole-page pass
+  passes.forEach((text, pi) => {
+    let order = 0;
+    for (const l of joinWrapped(cleanSheetText(text).split("\n"))) {
+      const ci = l.match(/Crew Itinerary\s*\([A-Z0-9]+\)/);
+      if (ci && !heads.includes(ci[0])) heads.push(ci[0]);
+      const pc = l.match(/\bPax\s*\((\d+)\)/);
+      if (pc && !heads.includes(`Pax (${pc[1]})`)) heads.push(`Pax (${pc[1]})`);
+      const px = paxInLine(l);
+      for (const x of px) {
+        const k = letterKey(x.name);
+        const dob = `${x.m}/${x.d}/${x.y}`;
+        // same person: names nearly identical, or fairly close with the same sex and birth date ("Qwen Youna")
+        let pr = people.find((q) => q.g === x.g && (similarity(q.key, k) >= 0.8 || (q.dobs[dob] && similarity(q.key, k) >= 0.55)));
+        if (!pr) { pr = { g: x.g, key: k, names: {}, dobs: {}, primary: false, gw: x.gw, at: order }; people.push(pr); }
+        vote(pr.names, x.name, pi); vote(pr.dobs, dob, pi);
+        pr.primary = pr.primary || x.primary; order++;
+      }
+      if (!px.length && looksLikePax(l)) unread.push(l.trim());
+      const nm = !px.length && nameOnly(l);
+      if (nm) {
+        const k = letterKey(nm.name);
+        let pr = plain.find((q) => similarity(q.key, k) >= 0.8);
+        if (!pr) { pr = { key: k, names: {}, primary: false, at: order }; plain.push(pr); }
+        vote(pr.names, nm.name, pi); pr.primary = pr.primary || nm.primary; order++;
+      }
+    }
+  });
+  const out = [...heads];
+  if (people.length) {
+    for (const q of people.sort((a, b) => a.at - b.at)) {
+      const name = best(q.names)[0][0], dobs = best(q.dobs);
+      const line = `${name} (${q.gw} - ${dobs[0][0]})${q.primary ? " Primary" : ""}`;
+      // no clear majority on the birth date: show both readings for the operator to check
+      if (dobs.length > 1 && dobs[1][1] >= dobs[0][1] - 0.5) out.push(`?? ${line}  — or DOB ${dobs[1][0]}?`);
+      else if (!name.includes(" ")) out.push(`?? ${line}  — first name missing?`);
+      else out.push(line);
+    }
+    // unreadable lines that no pass managed to parse
+    for (const u of [...new Set(unread)]) if (!people.some((q) => u.includes(best(q.names)[0][0].split(" ").pop()))) out.push(u);
+  } else {
+    // a plain list of names (no gender / birth date)
+    for (const q of plain.sort((a, b) => a.at - b.at)) out.push(best(q.names)[0][0] + (q.primary ? " Primary" : ""));
+  }
+  return out;
+}
+async function readTripSheetImages(images) {
+  const passes = [];
+  for (let i = 0; i < images.length; i++) {
+    const page = images.length > 1 ? `page ${i + 1} of ${images.length}, ` : "";
+    busyMsg(`Reading trip sheet (${page}pass 1 of 3)…`);
+    const img = enhance(await images[i](), 0.001);
+    const ps = await ocrPasses(img, (k) => busyMsg(`Reading trip sheet (${page}pass ${Math.min(k + 1, 3)} of 3)…`));
+    ps.forEach((t, k) => (passes[k] = (passes[k] || "") + t + "\n"));
+  }
+  lastSheetText = passes[0];
+  reviewSheet(mergePasses(passes), "Read");
 }
 // put the extracted list in the paste box for proof-reading, saying what (if anything) is missing
 function reviewSheet(lines, verb) {
@@ -738,39 +828,8 @@ async function loadSheetPhotos(files) {
   catch (e) { toast(`Trip sheet reading failed: ${e.message || e}`); }
   finally { busyMsg(""); }
 }
-async function renderPdfPages(buf) {
-  const doc = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false }).promise;
-  const pages = [];
-  for (let p = 1; p <= doc.numPages; p++) pages.push(async () => {
-    const page = await doc.getPage(p);
-    const vp0 = page.getViewport({ scale: 1 });
-    const vp = page.getViewport({ scale: Math.min(3, 2400 / vp0.width) });
-    const c = document.createElement("canvas"); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
-    const ctx = c.getContext("2d", { willReadFrequently: true });
-    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
-    await page.render({ canvasContext: ctx, viewport: vp }).promise;
-    return ctx.getImageData(0, 0, c.width, c.height);
-  });
-  return pages;
-}
-
 // ---------- wiring ----------
-async function loadPdf(file) {
-  busyMsg("Working…");
-  try {
-    const buf = new Uint8Array(await file.arrayBuffer());
-    const lines = await pdfToLines(buf.slice());
-    const t = parseManifest(lines);
-    if (t.legs.length && !t.unparsed.length && !shortLegs(t).length) { trip = t; legIdx = 0; render(); return; }
-    // something missing: show the list to proof-read instead of silently loading a short one
-    if (t.legs.length || t.unparsed.length) return reviewSheet(lines, "Found");
-    // no text layer (scanned / photographed PDF): read the page images
-    await readTripSheetImages(await renderPdfPages(buf));
-  } catch (e) { toast(e.message || e); }
-  finally { busyMsg(""); }
-}
 window.addEventListener("DOMContentLoaded", () => {
-  $("#pdf").onchange = (e) => loadPdf(e.target.files[0]);
   $("#ocrState").onclick = () => { if (lastPassportText) toast("Read: " + lastPassportText); };
   $("#sheetPhoto").onchange = (e) => { loadSheetPhotos(e.target.files); e.target.value = ""; };
   $("#pasteGo").onclick = () => {
@@ -791,10 +850,10 @@ window.addEventListener("DOMContentLoaded", () => {
     const btn = $("#close");
     if (!btn.dataset.armed) { btn.dataset.armed = "1"; btn.textContent = "Tap again to erase"; setTimeout(() => { delete btn.dataset.armed; btn.textContent = "Close trip & erase data"; }, 4000); return; }
     delete btn.dataset.armed; btn.textContent = "Close trip & erase data";
-    stopCam(); trip = null; $("#result").hidden = true; $("#paste").value = ""; $("#pdf").value = ""; render();
+    stopCam(); trip = null; $("#result").hidden = true; $("#paste").value = ""; render();
   };
   render();
 });
 
 // test hook (no effect in normal use)
-window.__idcheck = { pdfToLines, parseAAMVA, parseMRZ, readPassport, cleanSheetText, sheetToPaste, joinWrapped, loadSheetPhotos, parseGeneric, parseManifest, match, handleScan, scanPhoto, loadPdf, get trip() { return trip; } };
+window.__idcheck = { parseAAMVA, parseMRZ, readPassport, cleanSheetText, sheetToPaste, joinWrapped, loadSheetPhotos, parseGeneric, parseManifest, match, handleScan, scanPhoto, ocrImage, enhance, fileToImageData, ocrPasses, mergePasses, paxInLine, get trip() { return trip; }, get lastSheetText() { return lastSheetText; } };

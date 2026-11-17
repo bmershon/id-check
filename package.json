@@ -8,7 +8,6 @@
     "build": "npm run fetch-model && mkdir -p build && base64 -i node_modules/zxing-wasm/dist/reader/zxing_reader.wasm | tr -d \"\\n\" > build/zxing_reader.wasm.b64 && base64 -i node_modules/tesseract-wasm/dist/tesseract-core.wasm | tr -d \"\\n\" > build/tesseract-core.wasm.b64 && base64 -i build/eng.traineddata | tr -d \"\\n\" > build/eng.traineddata.b64 && node build.mjs"
   },
   "dependencies": {
-    "pdfjs-dist": "^4.10.38",
     "tesseract-wasm": "^0.10.0",
     "zxing-wasm": "^3.1.7"
   },
